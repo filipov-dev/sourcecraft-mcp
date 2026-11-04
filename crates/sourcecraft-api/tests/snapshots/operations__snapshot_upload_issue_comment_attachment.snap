@@ -1,0 +1,52 @@
+---
+source: crates/sourcecraft-api/tests/operations.rs
+expression: "snapshot_view(op(\"upload_issue_comment_attachment\"))"
+---
+{
+  "access": "Write",
+  "description": "Uploads attachment to an issue",
+  "id_operation_id": null,
+  "id_path": null,
+  "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "file": {
+        "description": "The file to upload. Absolute path to a local file; the server reads it and uploads its content as multipart field `file`.",
+        "type": "string"
+      },
+      "issue_comment_id": {
+        "description": "Issue comment ID",
+        "type": "string"
+      }
+    },
+    "required": [
+      "issue_comment_id",
+      "file"
+    ],
+    "type": "object"
+  },
+  "method": "POST",
+  "operation_id": "UploadIssueCommentAttachment",
+  "params": [
+    {
+      "description": "Issue comment ID",
+      "location": "Path",
+      "name": "issue_comment_id",
+      "required": true,
+      "value_type": "String",
+      "variant": "Common"
+    },
+    {
+      "description": "The file to upload. Absolute path to a local file; the server reads it and uploads its content as multipart field `file`.",
+      "location": "FormData",
+      "name": "file",
+      "required": true,
+      "value_type": "File",
+      "variant": "Common"
+    }
+  ],
+  "path": "/issue_comments/id:{issue_comment_id}/attachments",
+  "summary": "Upload attachment",
+  "tag": "Issues | Comments | Attachments",
+  "tool_name": "upload_issue_comment_attachment"
+}

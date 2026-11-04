@@ -1,0 +1,121 @@
+---
+source: crates/sourcecraft-api/tests/operations.rs
+expression: "snapshot_view(op(\"create_pull_request\"))"
+---
+{
+  "access": "Write",
+  "description": "",
+  "id_operation_id": "CreatePullRequestByID",
+  "id_path": "/repos/id:{repo_id}/pulls",
+  "input_schema": {
+    "additionalProperties": false,
+    "description": "Identify the target either by slug (`org_slug` + `repo_slug`) or by ID (`repo_id`); pass exactly one of these sets.",
+    "properties": {
+      "body": {
+        "description": "JSON request body.",
+        "properties": {
+          "description": {
+            "description": "Optional. Pull request description (up to 10Mb)",
+            "type": "string"
+          },
+          "fork_repo_id": {
+            "description": "Optional. Fork repository ID if creating PR from another repository",
+            "type": "string"
+          },
+          "publish": {
+            "description": "Whether to publish the PR immediately (default: false = draft)",
+            "type": "boolean"
+          },
+          "reviewer_ids": {
+            "description": "Optional. List of user IDs to assign as reviewers.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source_branch": {
+            "description": "Source branch name",
+            "type": "string"
+          },
+          "target_branch": {
+            "description": "Target branch name",
+            "type": "string"
+          },
+          "title": {
+            "description": "Pull request title (up to 1024 characters)",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "org_slug": {
+        "description": "Organization slug. Slug addressing (`org_slug` + `repo_slug`); omit when using `repo_id` instead.",
+        "type": "string"
+      },
+      "repo_id": {
+        "description": "Repository ID. ID addressing (`repo_id`); omit when using `org_slug` + `repo_slug` instead.",
+        "type": "string"
+      },
+      "repo_slug": {
+        "description": "Repository slug. Slug addressing (`org_slug` + `repo_slug`); omit when using `repo_id` instead.",
+        "type": "string"
+      },
+      "silent": {
+        "description": "Silent",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "body"
+    ],
+    "type": "object"
+  },
+  "method": "POST",
+  "operation_id": "CreatePullRequest",
+  "params": [
+    {
+      "description": "Organization slug. Slug addressing (`org_slug` + `repo_slug`); omit when using `repo_id` instead.",
+      "location": "Path",
+      "name": "org_slug",
+      "required": true,
+      "value_type": "String",
+      "variant": "Slug"
+    },
+    {
+      "description": "Repository slug. Slug addressing (`org_slug` + `repo_slug`); omit when using `repo_id` instead.",
+      "location": "Path",
+      "name": "repo_slug",
+      "required": true,
+      "value_type": "String",
+      "variant": "Slug"
+    },
+    {
+      "description": "JSON request body.",
+      "location": "Body",
+      "name": "body",
+      "required": true,
+      "value_type": "Object",
+      "variant": "Common"
+    },
+    {
+      "description": "Silent",
+      "location": "Query",
+      "name": "silent",
+      "required": false,
+      "value_type": "Boolean",
+      "variant": "Common"
+    },
+    {
+      "description": "Repository ID. ID addressing (`repo_id`); omit when using `org_slug` + `repo_slug` instead.",
+      "location": "Path",
+      "name": "repo_id",
+      "required": true,
+      "value_type": "String",
+      "variant": "Id"
+    }
+  ],
+  "path": "/repos/{org_slug}/{repo_slug}/pulls",
+  "summary": "Create PullRequest in Repository",
+  "tag": "Repository | PullRequest",
+  "tool_name": "create_pull_request"
+}

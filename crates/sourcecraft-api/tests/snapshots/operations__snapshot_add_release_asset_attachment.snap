@@ -1,0 +1,100 @@
+---
+source: crates/sourcecraft-api/tests/operations.rs
+expression: "snapshot_view(op(\"add_release_asset_attachment\"))"
+---
+{
+  "access": "Write",
+  "description": "Uploads attachment to a release and adds it as an asset",
+  "id_operation_id": "AddReleaseAssetAttachmentByID",
+  "id_path": "/releases/id:{release_id}/attachments",
+  "input_schema": {
+    "additionalProperties": false,
+    "description": "Identify the target either by slug (`org_slug` + `repo_slug` + `release_tag`) or by ID (`release_id`); pass exactly one of these sets.",
+    "properties": {
+      "file": {
+        "description": "The file to upload. Absolute path to a local file; the server reads it and uploads its content as multipart field `file`.",
+        "type": "string"
+      },
+      "name": {
+        "description": "The intended name of the asset. Used only with slug addressing (`org_slug` + `repo_slug` + `release_tag`).",
+        "type": "string"
+      },
+      "org_slug": {
+        "description": "Organization slug. Slug addressing (`org_slug` + `repo_slug` + `release_tag`); omit when using `release_id` instead.",
+        "type": "string"
+      },
+      "release_id": {
+        "description": "Release ID. ID addressing (`release_id`); omit when using `org_slug` + `repo_slug` + `release_tag` instead.",
+        "type": "string"
+      },
+      "release_tag": {
+        "description": "Release tag. Slug addressing (`org_slug` + `repo_slug` + `release_tag`); omit when using `release_id` instead.",
+        "type": "string"
+      },
+      "repo_slug": {
+        "description": "Repository slug. Slug addressing (`org_slug` + `repo_slug` + `release_tag`); omit when using `release_id` instead.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "file"
+    ],
+    "type": "object"
+  },
+  "method": "POST",
+  "operation_id": "AddReleaseAssetAttachment",
+  "params": [
+    {
+      "description": "Organization slug. Slug addressing (`org_slug` + `repo_slug` + `release_tag`); omit when using `release_id` instead.",
+      "location": "Path",
+      "name": "org_slug",
+      "required": true,
+      "value_type": "String",
+      "variant": "Slug"
+    },
+    {
+      "description": "Repository slug. Slug addressing (`org_slug` + `repo_slug` + `release_tag`); omit when using `release_id` instead.",
+      "location": "Path",
+      "name": "repo_slug",
+      "required": true,
+      "value_type": "String",
+      "variant": "Slug"
+    },
+    {
+      "description": "Release tag. Slug addressing (`org_slug` + `repo_slug` + `release_tag`); omit when using `release_id` instead.",
+      "location": "Path",
+      "name": "release_tag",
+      "required": true,
+      "value_type": "String",
+      "variant": "Slug"
+    },
+    {
+      "description": "The file to upload. Absolute path to a local file; the server reads it and uploads its content as multipart field `file`.",
+      "location": "FormData",
+      "name": "file",
+      "required": true,
+      "value_type": "File",
+      "variant": "Common"
+    },
+    {
+      "description": "The intended name of the asset. Used only with slug addressing (`org_slug` + `repo_slug` + `release_tag`).",
+      "location": "FormData",
+      "name": "name",
+      "required": true,
+      "value_type": "String",
+      "variant": "Slug"
+    },
+    {
+      "description": "Release ID. ID addressing (`release_id`); omit when using `org_slug` + `repo_slug` + `release_tag` instead.",
+      "location": "Path",
+      "name": "release_id",
+      "required": true,
+      "value_type": "String",
+      "variant": "Id"
+    }
+  ],
+  "path": "/repos/{org_slug}/{repo_slug}/releases/tag/{release_tag}/attachments",
+  "summary": "Upload Attachment As Release Asset (By Release Tag)",
+  "tag": "Release | Attachments",
+  "tool_name": "add_release_asset_attachment"
+}
