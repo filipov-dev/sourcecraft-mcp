@@ -1,6 +1,7 @@
 //! `sourcecraft-mcp` — MCP-сервер и CLI для SourceCraft REST API.
 
 mod base_url;
+mod browser;
 mod cli;
 mod clients;
 mod profiles;
@@ -25,7 +26,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the MCP server over stdio.
+    /// Run the MCP server over stdio, or over HTTP with --http.
     Serve(cli::serve::ServeArgs),
     /// Register the server in an MCP client with its own token profile.
     Connect(cli::connect::ConnectArgs),
@@ -37,6 +38,12 @@ enum Command {
     Secret(cli::secret::SecretCommand),
     /// List toolsets that can be passed to `--toolsets`.
     Toolsets,
+    /// Custom tools defined in tools.toml.
+    #[command(subcommand)]
+    Tools(cli::tools::ToolsCommand),
+    /// Internal: evaluate one `jq` filter for `serve` (JSON on stdin and stdout).
+    #[command(name = "jq-worker", hide = true)]
+    JqWorker,
 }
 
 #[tokio::main]
@@ -57,5 +64,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         Command::Auth(command) => cli::auth::run(command).await.map(|()| ExitCode::SUCCESS),
         Command::Secret(command) => cli::secret::run(command).await,
         Command::Toolsets => cli::toolsets::run().map(|()| ExitCode::SUCCESS),
+        Command::Tools(command) => cli::tools::run(command).map(|()| ExitCode::SUCCESS),
+        Command::JqWorker => cli::jq_worker::run().map(|()| ExitCode::SUCCESS),
     }
 }

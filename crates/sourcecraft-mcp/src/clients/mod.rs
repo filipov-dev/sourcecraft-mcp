@@ -7,8 +7,18 @@ use std::path::Path;
 
 use anyhow::{Context, bail};
 use clap::ValueEnum;
+use sourcecraft_api::AccessLevel;
 
 use crate::profiles::ProfileSettings;
+
+/// Абсолютный путь к бинарнику для тестов. В Windows путь без буквы диска не абсолютный,
+/// поэтому `/usr/local/bin/...` там не годится.
+#[cfg(test)]
+pub(crate) const TEST_EXE: &str = if cfg!(windows) {
+    r"C:\tools\sourcecraft-mcp.exe"
+} else {
+    "/usr/local/bin/sourcecraft-mcp"
+};
 
 /// Имя сервера в конфигурации MCP-клиентов.
 pub const SERVER_NAME: &str = "sourcecraft";
@@ -82,10 +92,12 @@ impl ServerSpec {
             "--profile".to_owned(),
             profile.to_owned(),
         ];
-        if settings.allow_write {
+        // Флаги — по действующему уровню: удаление всегда передаётся вместе с записью.
+        let access = settings.access_level();
+        if access.allows(AccessLevel::Write) {
             args.push("--allow-write".to_owned());
         }
-        if settings.allow_destructive {
+        if access == AccessLevel::Destructive {
             args.push("--allow-destructive".to_owned());
         }
         if !settings.toolsets.is_empty() {
@@ -94,6 +106,9 @@ impl ServerSpec {
         }
         if settings.allow_secret_values {
             args.push("--allow-secret-values".to_owned());
+        }
+        if settings.dynamic_toolsets {
+            args.push("--dynamic-toolsets".to_owned());
         }
         Ok(Self { command, args })
     }
@@ -135,9 +150,9 @@ mod tests {
 
     #[test]
     fn server_spec_args() {
-        let exe = PathBuf::from("/opt/homebrew/bin/sourcecraft-mcp");
+        let exe = PathBuf::from(TEST_EXE);
         let spec = ServerSpec::new(&exe, "codex", &ProfileSettings::default()).unwrap();
-        assert_eq!(spec.command, "/opt/homebrew/bin/sourcecraft-mcp");
+        assert_eq!(spec.command, TEST_EXE);
         assert_eq!(spec.args, ["serve", "--profile", "codex"]);
 
         let settings = ProfileSettings {
@@ -146,6 +161,7 @@ mod tests {
             allow_destructive: true,
             toolsets: vec!["repos".into(), "issues".into()],
             allow_secret_values: true,
+            dynamic_toolsets: true,
         };
         let spec = ServerSpec::new(&exe, "ci", &settings).unwrap();
         assert_eq!(
@@ -158,7 +174,28 @@ mod tests {
                 "--allow-destructive",
                 "--toolsets",
                 "repos,issues",
-                "--allow-secret-values"
+                "--allow-secret-values",
+                "--dynamic-toolsets"
+            ]
+        );
+    }
+
+    #[test]
+    fn server_spec_destructive_implies_write() {
+        let exe = PathBuf::from(TEST_EXE);
+        let settings = ProfileSettings {
+            allow_destructive: true,
+            ..ProfileSettings::default()
+        };
+        let spec = ServerSpec::new(&exe, "ci", &settings).unwrap();
+        assert_eq!(
+            spec.args,
+            [
+                "serve",
+                "--profile",
+                "ci",
+                "--allow-write",
+                "--allow-destructive"
             ]
         );
     }

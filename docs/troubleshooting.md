@@ -24,14 +24,17 @@ macOS может спросить, разрешить ли `sourcecraft-mcp` д�
 
 ## Linux: Secret Service недоступен
 
-В Linux токен хранится через Secret Service (D-Bus). Ошибка системного хранилища токенов при `connect`, `auth login` или `serve` обычно означает одно из:
+В Linux токен хранится через Secret Service (D-Bus). Библиотека `libdbus-1` не нужна: бинарник обращается к шине сам. Ошибка системного хранилища токенов при `connect`, `auth login` или `serve` обычно означает одно из:
 
-- не установлена библиотека `libdbus-1` (пакет `libdbus-1-3` в Debian и Ubuntu, `dbus-libs` в Fedora);
 - в сессии не запущен провайдер Secret Service — GNOME Keyring, KeePassXC (с включённой интеграцией Secret Service), KWallet и т. п.;
 - нет сессионной шины D-Bus: например, при входе по SSH на сервер без графической сессии;
 - связка ключей заблокирована и разблокировать её некому.
 
 На машине без графической сессии запустите провайдер Secret Service в сессии D-Bus пользователя или используйте `sourcecraft-mcp` на рабочей машине с графической сессией. Хранить токен в переменной окружения или файле нельзя — это намеренное ограничение.
+
+## Linux: «No CA certificates were loaded from the system»
+
+`serve`, `connect` и `auth login` проверяют сертификат SourceCraft по корневым сертификатам системы. В минимальных образах (Debian/Ubuntu slim и т. п.) их нет: поставьте пакет `ca-certificates` (`apt-get install ca-certificates`) или укажите файл сертификатов в переменной `SSL_CERT_FILE`.
 
 ## «no SourceCraft token is stored for profile …»
 
@@ -71,4 +74,4 @@ sourcecraft-mcp auth login --profile <профиль>
 
 ## Ответ обрезан
 
-Ответы больше `--max-response-bytes` (256 KiB по умолчанию) обрезаются. Запросите меньше данных (`page_size`, фильтры) или увеличьте лимит в аргументах сервера.
+Ответы больше `--max-response-bytes` (256 KiB по умолчанию) обрезаются. Запросите меньше данных (`page_size`, фильтры), оставьте только нужные поля [фильтром `jq`](tools.md#фильтр-ответа-jq) или увеличьте лимит в аргументах сервера.

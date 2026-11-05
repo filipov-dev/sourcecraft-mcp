@@ -4,7 +4,8 @@
 //! - `exec` передаёт секреты команде в переменных окружения и маскирует их в её выводе;
 //! - `write` пишет значение в новый файл с правами 0600 (для `scp`, `ssh -i` и т. п.);
 //! - `list` показывает только ключи;
-//! - `get --reveal` печатает значение — явное и осознанное раскрытие.
+//! - `get --reveal` печатает значение — явное и осознанное раскрытие;
+//! - `copy` копирует секрет между репозиториями и системным хранилищем, не выводя значение.
 //!
 //! `get` не требует `allow_secret_values` профиля: эта настройка ограничивает ответы
 //! MCP-сервера, а CLI запускают явно. Против агента с доступом к оболочке настройка всё равно
@@ -13,6 +14,7 @@
 //!
 //! Токен берётся только из системного хранилища по профилю, как у `serve`.
 
+mod copy;
 mod exec;
 mod fetch;
 mod mask;
@@ -27,10 +29,11 @@ use std::time::Duration;
 use anyhow::{anyhow, bail};
 use clap::{Args, Subcommand};
 use sourcecraft_api::executor::{ApiClient, ClientConfig};
+use sourcecraft_api::keychain::SystemKeychain;
 
 use crate::base_url::{BASE_URL_ENV, resolve_base_url};
 use crate::profiles::load_profile_explained;
-use fetch::{RepoTarget, Secrets, fetch_secrets};
+use fetch::{RepoTarget, Secrets, fetch_secrets, repo_target};
 
 /// Переменная окружения с профилем по умолчанию для команд `secret` (имя профиля, не токен).
 pub const PROFILE_ENV: &str = "SOURCECRAFT_MCP_PROFILE";
@@ -53,6 +56,9 @@ pub enum SecretCommand {
     /// Print a secret value. Requires --reveal.
     #[command(after_help = GET_HELP)]
     Get(GetArgs),
+    /// Copy a secret between repositories or the system keychain without printing it.
+    #[command(after_help = COPY_HELP)]
+    Copy(copy::CopyArgs),
 }
 
 const EXEC_HELP: &str = "\
@@ -64,6 +70,8 @@ To use $NAME in a command line, run a shell yourself, in single quotes, so that 
 expands it:
   sourcecraft-mcp secret exec --repo acme/web --env KEY=DEPLOY_KEY -- \\
     sh -c 'printf %s \"$KEY\" | ssh deploy@host \"cat > ~/.config/app/key\"'
+On Windows without sh, run PowerShell the same way and use $env:KEY inside the quotes:
+  sourcecraft-mcp secret exec --repo acme/web --env KEY=API_KEY -- powershell -NoProfile -Command '.\\deploy.ps1 -ApiKey $env:KEY'
 
 Never echo or print secret variables. Masking is a safety net against accidental output, not a \
 security boundary: a value that the command transforms (hex, URL encoding, split) is not \
@@ -71,7 +79,9 @@ recognized.";
 
 const WRITE_HELP: &str = "\
 The file is created new (an existing file or symlink is not overwritten without --force) with \
-mode 0600. Only the path and the number of bytes are printed. Delete the file when done:
+mode 0600. On Windows the mode is ignored and the file inherits the permissions of its \
+folder: write it to a folder only you can read (for example under %USERPROFILE%), not a shared \
+one. Only the path and the number of bytes are printed. Delete the file when done:
   sourcecraft-mcp secret write --repo acme/web DEPLOY_KEY --to /tmp/deploy_key && \\
     scp -i /tmp/deploy_key build.tar deploy@host: ; rm -f /tmp/deploy_key";
 
@@ -79,6 +89,20 @@ const GET_HELP: &str = "\
 Without --reveal the command fails: prefer `secret exec` or `secret write`, which use the value \
 without showing it. With --reveal the value is printed to stdout as is; when stdout is not a \
 terminal, a reminder is printed to stderr that the value is now in the caller's output.";
+
+const COPY_HELP: &str = "\
+References:
+  sc://<org>/<repo>/<KEY>[?group=<name>]   a repository secret
+  keychain://<service>/<account>           an item of the system keychain on this machine
+
+The value is read and written by sourcecraft-mcp and never printed; only the references and \
+the result (created or overwritten) are shown. An existing destination is replaced only with \
+--force. Items that hold sourcecraft-mcp tokens cannot be copied or overwritten. Writing a \
+repository secret is asynchronous: the command waits up to a minute for it to finish.
+
+Examples:
+  sourcecraft-mcp secret copy sc://acme/web/DEPLOY_KEY sc://acme/api/DEPLOY_KEY
+  sourcecraft-mcp secret copy keychain://deploy.example.com/ci sc://acme/web/DEPLOY_PASSWORD";
 
 /// Профиль, репозиторий и адрес API — общие аргументы всех команд `secret`.
 #[derive(Debug, Args)]
@@ -128,7 +152,7 @@ pub struct WriteArgs {
     /// File to create.
     #[arg(long, value_name = "PATH")]
     pub to: PathBuf,
-    /// File mode, octal.
+    /// File mode, octal (ignored on Windows: the file inherits the folder permissions).
     #[arg(long, value_name = "OCTAL", default_value = "600", value_parser = write::parse_mode)]
     pub mode: u32,
     /// Replace an existing file.
@@ -169,19 +193,24 @@ pub async fn run(command: SecretCommand) -> anyhow::Result<ExitCode> {
             if value.is_empty() {
                 warn(format!("secret `{}` is empty", args.key));
             }
-            if args.mode & 0o077 != 0 {
+            // На Windows права Unix не применяются (см. write.rs): предупреждать не о чем.
+            if cfg!(unix) && args.mode & 0o077 != 0 {
                 warn(format!(
                     "mode {:o} lets other users read the secret file",
                     args.mode
                 ));
             }
             write::write_secret_file(&args.to, value, args.mode, args.force)?;
-            println!(
-                "Wrote {} bytes to {} (mode {:o})",
-                value.len(),
-                args.to.display(),
-                args.mode
-            );
+            if cfg!(unix) {
+                println!(
+                    "Wrote {} bytes to {} (mode {:o})",
+                    value.len(),
+                    args.to.display(),
+                    args.mode
+                );
+            } else {
+                println!("Wrote {} bytes to {}", value.len(), args.to.display());
+            }
             Ok(ExitCode::SUCCESS)
         }
         SecretCommand::List(args) => {
@@ -223,6 +252,21 @@ pub async fn run(command: SecretCommand) -> anyhow::Result<ExitCode> {
                     args.key
                 );
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        SecretCommand::Copy(args) => {
+            // Ссылки проверяем до обращения к keychain и API.
+            let (source, destination) = copy::parse_refs(&args)?;
+            let client = api_client(&args.profile, args.base_url.as_deref())?;
+            let report = copy::copy(
+                &client,
+                std::sync::Arc::new(SystemKeychain),
+                &source,
+                &destination,
+                args.force,
+            )
+            .await?;
+            println!("{}", copy::describe(&report));
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -281,18 +325,23 @@ async fn run_exec(args: ExecArgs) -> anyhow::Result<ExitCode> {
 
 /// Клиент API для профиля и репозиторий из аргументов.
 fn connect(target: &TargetArgs) -> anyhow::Result<(ApiClient, RepoTarget)> {
-    let repo = RepoTarget::from_args(target.repo.as_deref(), target.repo_id.as_deref())?;
+    let repo = repo_target(target.repo.as_deref(), target.repo_id.as_deref())?;
+    let client = api_client(&target.profile, target.base_url.as_deref())?;
+    Ok((client, repo))
+}
+
+/// Клиент API с токеном профиля.
+fn api_client(profile: &str, base_url: Option<&str>) -> anyhow::Result<ApiClient> {
     let from_env = std::env::var(BASE_URL_ENV).ok();
-    let base_url = resolve_base_url(target.base_url.as_deref(), from_env.as_deref())?;
-    let (_settings, token) = load_profile_explained(&target.profile)?;
-    let client = ApiClient::new(ClientConfig {
+    let base_url = resolve_base_url(base_url, from_env.as_deref())?;
+    let (_settings, token) = load_profile_explained(profile)?;
+    ApiClient::new(ClientConfig {
         base_url,
-        token,
+        token: Some(token),
         timeout: TIMEOUT,
         max_response_bytes: MAX_RESPONSE_BYTES,
     })
-    .map_err(|err| anyhow!("cannot create the SourceCraft API client: {err}"))?;
-    Ok((client, repo))
+    .map_err(|err| anyhow!("cannot create the SourceCraft API client: {err}"))
 }
 
 fn require<'a>(secrets: &'a Secrets, key: &str) -> anyhow::Result<&'a [u8]> {
@@ -391,6 +440,27 @@ mod tests {
         };
         assert!(!args.reveal);
         assert_eq!(args.target.profile, "default");
+    }
+
+    #[test]
+    fn parses_copy() {
+        let SecretCommand::Copy(args) =
+            parse(&["copy", "--force", "sc://acme/web/K", "keychain://svc/acct"]).unwrap()
+        else {
+            panic!("not copy");
+        };
+        assert!(args.force);
+        assert_eq!(args.profile, "default");
+        let (source, destination) = copy::parse_refs(&args).unwrap();
+        assert_eq!(source.to_string(), "sc://acme/web/K");
+        assert_eq!(destination.to_string(), "keychain://svc/acct");
+
+        assert!(parse(&["copy", "sc://acme/web/K"]).is_err());
+        let SecretCommand::Copy(args) = parse(&["copy", "acme/web/K", "sc://a/b/K"]).unwrap()
+        else {
+            panic!("not copy");
+        };
+        assert!(copy::parse_refs(&args).is_err());
     }
 
     #[test]

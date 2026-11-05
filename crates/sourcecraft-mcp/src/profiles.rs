@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use sourcecraft_api::ApiToken;
 use sourcecraft_api::auth::{AuthError, KeyringStore, TokenStore};
+use sourcecraft_api::{AccessLevel, ApiToken};
 
 /// Переменная окружения, которая переопределяет каталог конфигурации (нужна для тестов).
 pub const CONFIG_DIR_ENV: &str = "SOURCECRAFT_MCP_CONFIG_DIR";
@@ -37,6 +37,40 @@ pub struct ProfileSettings {
     pub toolsets: Vec<String>,
     /// Разрешено раскрывать значения секретов по явному запросу (`serve --allow-secret-values`).
     pub allow_secret_values: bool,
+    /// Наборы инструментов включаются агентом по запросу (`serve --dynamic-toolsets`).
+    /// Не записывается, если выключено: файл остаётся читаемым прежними версиями.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dynamic_toolsets: bool,
+}
+
+impl ProfileSettings {
+    /// Действующий уровень доступа профиля: удаление подразумевает запись.
+    ///
+    /// Учитывает оба флага, поэтому и старые профили с `allow_destructive = true` и
+    /// `allow_write = false` дают уровень `Destructive`.
+    pub fn access_level(&self) -> AccessLevel {
+        access_level(self.allow_write, self.allow_destructive)
+    }
+
+    /// Приводит флаги доступа к действующему уровню: `allow_destructive` включает `allow_write`.
+    pub fn normalized(mut self) -> Self {
+        let access = self.access_level();
+        self.allow_write = access.allows(AccessLevel::Write);
+        self.allow_destructive = access == AccessLevel::Destructive;
+        self
+    }
+}
+
+/// Уровень доступа по флагам `--allow-write` и `--allow-destructive`: удаление подразумевает
+/// запись. Единое правило для `serve`, `connect` и `auth status`.
+pub fn access_level(allow_write: bool, allow_destructive: bool) -> AccessLevel {
+    if allow_destructive {
+        AccessLevel::Destructive
+    } else if allow_write {
+        AccessLevel::Write
+    } else {
+        AccessLevel::Read
+    }
 }
 
 /// Содержимое `profiles.toml`.
@@ -97,11 +131,14 @@ impl ProfileRepo {
         Ok(self.load()?.profiles.remove(name))
     }
 
-    /// Создаёт или заменяет профиль.
+    /// Создаёт или заменяет профиль. Флаги доступа сохраняются нормализованными
+    /// (см. [`ProfileSettings::normalized`]).
     pub fn upsert(&self, name: &str, settings: ProfileSettings) -> anyhow::Result<()> {
         validate_profile_name(name)?;
         let mut document = self.load()?;
-        document.profiles.insert(name.to_owned(), settings);
+        document
+            .profiles
+            .insert(name.to_owned(), settings.normalized());
         self.save(&document)
     }
 
@@ -192,6 +229,7 @@ mod tests {
             allow_destructive: false,
             toolsets: vec!["repos".into(), "issues".into()],
             allow_secret_values: true,
+            dynamic_toolsets: true,
         }
     }
 
@@ -213,6 +251,9 @@ mod tests {
         let text = fs::read_to_string(repo.path()).unwrap();
         assert!(text.contains("[profiles.codex]"), "{text}");
         assert!(text.contains("allow_write = true"), "{text}");
+        assert!(text.contains("dynamic_toolsets = true"), "{text}");
+        // Выключенная настройка не записывается.
+        assert_eq!(text.matches("dynamic_toolsets").count(), 1, "{text}");
 
         assert!(repo.remove("codex").unwrap());
         assert!(!repo.remove("codex").unwrap());
@@ -233,8 +274,55 @@ mod tests {
         assert!(ci.allow_write);
         assert!(!ci.allow_destructive);
         assert!(!ci.allow_secret_values);
+        assert!(!ci.dynamic_toolsets);
         assert!(ci.toolsets.is_empty());
         assert_eq!(repo.get("empty").unwrap(), Some(ProfileSettings::default()));
+    }
+
+    #[test]
+    fn destructive_implies_write() {
+        let cases = [
+            (false, false, AccessLevel::Read),
+            (true, false, AccessLevel::Write),
+            (false, true, AccessLevel::Destructive),
+            (true, true, AccessLevel::Destructive),
+        ];
+        for (write, destructive, level) in cases {
+            assert_eq!(access_level(write, destructive), level);
+            let settings = ProfileSettings {
+                allow_write: write,
+                allow_destructive: destructive,
+                ..ProfileSettings::default()
+            };
+            assert_eq!(settings.access_level(), level);
+            let normalized = settings.normalized();
+            assert_eq!(normalized.access_level(), level);
+            assert_eq!(normalized.allow_write, level != AccessLevel::Read);
+            assert_eq!(
+                normalized.allow_destructive,
+                level == AccessLevel::Destructive
+            );
+        }
+    }
+
+    #[test]
+    fn upsert_normalizes_and_old_profiles_read_as_destructive() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = ProfileRepo::in_dir(dir.path());
+        // Профиль, сохранённый старой версией: удаление без записи.
+        fs::write(repo.path(), "[profiles.old]\nallow_destructive = true\n").unwrap();
+        let old = repo.get("old").unwrap().unwrap();
+        assert!(!old.allow_write);
+        assert_eq!(old.access_level(), AccessLevel::Destructive);
+
+        let settings = ProfileSettings {
+            allow_destructive: true,
+            ..ProfileSettings::default()
+        };
+        repo.upsert("new", settings).unwrap();
+        let saved = repo.get("new").unwrap().unwrap();
+        assert!(saved.allow_write);
+        assert!(saved.allow_destructive);
     }
 
     #[test]

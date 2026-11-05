@@ -135,7 +135,10 @@ pub fn take_reveal(
 
 /// Описание инструмента `secret_set`. Схема адресации и описания аргументов берутся из
 /// операции `set_secret`, тело (`body`) заменяется аргументами значения.
-pub fn secret_set_tool(op: &OperationDef) -> Result<Tool, String> {
+///
+/// `local_files: false` (HTTP-режим): аргумента `value_file` нет — сервер не на машине агента
+/// и не может прочитать его файл.
+pub fn secret_set_tool(op: &OperationDef, local_files: bool) -> Result<Tool, String> {
     let mut schema: JsonObject = serde_json::from_str(op.input_schema)
         .map_err(|err| format!("{}: invalid input schema: {err}", op.tool_name))?;
     let addressing = schema
@@ -145,51 +148,91 @@ pub fn secret_set_tool(op: &OperationDef) -> Result<Tool, String> {
         .to_owned();
     if let Some(Value::Object(properties)) = schema.get_mut("properties") {
         properties.remove("body");
-        properties.insert(
-            "value".to_owned(),
-            json!({
-                "type": "string",
-                "description": "The secret value as plain text; the server base64-encodes it. \
-                    Do not encode it yourself. Prefer `value_file` so the value does not appear \
-                    in the conversation. Pass exactly one of `value` or `value_file`.",
-            }),
-        );
-        properties.insert(
-            "value_file".to_owned(),
-            json!({
-                "type": "string",
-                "description": "Path to a local file whose content is the secret value \
-                    (any bytes, up to 64 KiB). The path must be inside the directories allowed \
-                    by the server. The value is read by the server and never shown.",
-            }),
-        );
-        properties.insert(
-            "trim_trailing_newline".to_owned(),
-            json!({
-                "type": "boolean",
-                "description": "Remove one trailing line ending (`\\n` or `\\r\\n`) from the \
-                    value. Default: true for `value_file` (files usually end with a newline), \
-                    false for `value`.",
-            }),
-        );
+        if local_files {
+            properties.insert(
+                "value".to_owned(),
+                json!({
+                    "type": "string",
+                    "description": "The secret value as plain text; the server base64-encodes it. \
+                        Do not encode it yourself. Prefer `value_file` so the value does not appear \
+                        in the conversation. Pass exactly one of `value` or `value_file`.",
+                }),
+            );
+            properties.insert(
+                "value_file".to_owned(),
+                json!({
+                    "type": "string",
+                    "description": "Path to a local file whose content is the secret value \
+                        (any bytes, up to 64 KiB). The path must be inside the directories allowed \
+                        by the server. The value is read by the server and never shown.",
+                }),
+            );
+            properties.insert(
+                "trim_trailing_newline".to_owned(),
+                json!({
+                    "type": "boolean",
+                    "description": "Remove one trailing line ending (`\\n` or `\\r\\n`) from the \
+                        value. Default: true for `value_file` (files usually end with a newline), \
+                        false for `value`.",
+                }),
+            );
+        } else {
+            properties.insert(
+                "value".to_owned(),
+                json!({
+                    "type": "string",
+                    "description": "The secret value as plain text; the server base64-encodes it. \
+                        Do not encode it yourself.",
+                }),
+            );
+            properties.insert(
+                "trim_trailing_newline".to_owned(),
+                json!({
+                    "type": "boolean",
+                    "description": "Remove one trailing line ending (`\\n` or `\\r\\n`) from the \
+                        value. Default: false.",
+                }),
+            );
+        }
     }
+    let required = if local_files {
+        vec!["key"]
+    } else {
+        vec!["key", "value"]
+    };
     schema.insert(
         "required".to_owned(),
-        Value::Array(vec![Value::String("key".to_owned())]),
+        Value::Array(
+            required
+                .into_iter()
+                .map(|r| Value::String(r.to_owned()))
+                .collect(),
+        ),
     );
 
+    let value_source = if local_files {
+        "Takes the value as plain text and base64-encodes it itself. Prefer `value_file`: the \
+         server reads the value from a local file, so it never enters the conversation (for \
+         example, ask the user to put it into a file)."
+    } else {
+        "Takes the value as plain text (`value`) and base64-encodes it itself. The value passes \
+         through the conversation: set a secret only when the user gave you the value for this \
+         purpose; otherwise ask the user to set it in SourceCraft."
+    };
     let description = format!(
         "Create or update a repository secret (secrets are used by SourceCraft CI).\n\n\
-         Takes the value as plain text and base64-encodes it itself. Prefer `value_file`: the \
-         server reads the value from a local file, so it never enters the conversation (for \
-         example, ask the user to put it into a file). Empty values are rejected; to remove a \
+         {value_source} Empty values are rejected; to remove a \
          secret use `delete_secret`. The secret is set asynchronously: the response is an \
          operation, poll it with `get_secret_operation`. Never echo, log or commit the value.\n\n\
          {addressing}\n\n\
          Access: destructive (overwrites the secret; the old value cannot be restored)."
     );
     let mut tool = Tool::new(SECRET_SET_TOOL, description, Arc::new(schema));
-    tool.title = Some("Create or update a secret from plain text or a file".to_owned());
+    tool.title = Some(if local_files {
+        "Create or update a secret from plain text or a file".to_owned()
+    } else {
+        "Create or update a secret from plain text".to_owned()
+    });
     tool.annotations = Some(
         ToolAnnotations::new()
             .read_only(false)
@@ -254,6 +297,11 @@ pub async fn build_secret_set(
                 "pass exactly one of `value` or `value_file`, not both",
             ));
         }
+        (None, None) if files.is_disabled() => {
+            return Err(ToolError::new(
+                "missing the secret value: pass it as plain text in `value`",
+            ));
+        }
         (None, None) => {
             return Err(ToolError::new(
                 "missing the secret value: pass `value_file` (a local file with the value, \
@@ -283,11 +331,7 @@ pub async fn build_secret_set(
     op_args.insert("body".to_owned(), json!({ "value": encoded }));
     let request = build_request(op, &op_args, files)?;
 
-    let mut sensitive = vec![encoded];
-    if let Ok(text) = String::from_utf8(value) {
-        sensitive.push(text);
-    }
-    sensitive.retain(|s| s.len() >= MIN_SCRUB_LEN);
+    let sensitive = sensitive_forms(&value);
     Ok(SecretSetRequest { request, sensitive })
 }
 
@@ -317,6 +361,17 @@ fn trim_trailing_newline(value: &mut Vec<u8>) {
             value.pop();
         }
     }
+}
+
+/// Формы значения, которые нужно вычищать из ответов и ошибок: base64 и (если это UTF-8)
+/// сам текст. Слишком короткие формы не вычищаются (см. [`MIN_SCRUB_LEN`]).
+pub fn sensitive_forms(value: &[u8]) -> Vec<String> {
+    let mut sensitive = vec![encode_secret_value(value)];
+    if let Ok(text) = std::str::from_utf8(value) {
+        sensitive.push(text.to_owned());
+    }
+    sensitive.retain(|s| s.len() >= MIN_SCRUB_LEN);
+    sensitive
 }
 
 /// Заменяет вхождения чувствительных строк на [`REDACTED`].
@@ -565,7 +620,7 @@ mod tests {
     #[test]
     fn tool_schema() {
         let op = find(SET_SECRET_OPERATION).unwrap();
-        let tool = secret_set_tool(op).unwrap();
+        let tool = secret_set_tool(op, true).unwrap();
         assert_eq!(tool.name, SECRET_SET_TOOL);
         let properties = tool.input_schema["properties"].as_object().unwrap();
         let mut names: Vec<&str> = properties.keys().map(String::as_str).collect();
@@ -578,6 +633,35 @@ mod tests {
         let annotations = tool.annotations.unwrap();
         assert_eq!(annotations.destructive_hint, Some(true));
         assert!(tool.description.unwrap().contains("Access: destructive"));
+
+        // Удалённый сервер (HTTP): без `value_file`, значение обязательно.
+        let remote = secret_set_tool(op, false).unwrap();
+        let properties = remote.input_schema["properties"].as_object().unwrap();
+        assert!(!properties.contains_key("value_file"));
+        assert!(properties.contains_key("value"));
+        assert_eq!(remote.input_schema["required"], json!(["key", "value"]));
+        let description = remote.description.unwrap();
+        assert!(!description.contains("value_file"), "{description}");
+        assert!(!description.contains("local file"), "{description}");
+    }
+
+    #[tokio::test]
+    async fn value_file_is_rejected_without_local_files() {
+        let files = FilePolicy::disabled();
+        let base = json!({"org_slug": "acme", "repo_slug": "web", "key": "K"});
+        let mut with_file = args(base.clone());
+        with_file.insert("value_file".into(), json!("/etc/hosts"));
+        let err = build_secret_set(&with_file, &files).await.unwrap_err();
+        assert!(err.message().contains("HTTP mode"), "{err}");
+
+        let err = build_secret_set(&args(base.clone()), &files)
+            .await
+            .unwrap_err();
+        assert!(!err.message().contains("value_file"), "{err}");
+
+        let mut with_value = args(base);
+        with_value.insert("value".into(), json!("plain"));
+        assert!(build_secret_set(&with_value, &files).await.is_ok());
     }
 
     #[test]

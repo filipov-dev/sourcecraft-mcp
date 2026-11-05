@@ -1,7 +1,13 @@
+# Dockerfile копирует только Cargo.toml, Cargo.lock и crates/; остальное в контекст не нужно.
 target
+**/target
 .git
 .claude
 .plans
+docs
+scripts
+*.md
+!crates/**/*.md
 .env
 .env.*
 .DS_Store

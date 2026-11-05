@@ -13,6 +13,10 @@
 //! Корни и пути канонизируются (`canonicalize`), поэтому выход через `..` и символические
 //! ссылки обнаруживается: проверяется реальный путь, а не то, как он записан.
 //! Относительный путь разрешается относительно рабочего каталога сервера.
+//!
+//! Сервер в HTTP-режиме работает не на машине агента, поэтому локальные файлы там выключены
+//! целиком ([`FilePolicy::disabled`]): любой путь отклоняется, даже если аргумент с путём
+//! дошёл до проверки.
 
 use std::fmt;
 use std::io;
@@ -37,7 +41,13 @@ pub struct FilePolicy {
     roots: Vec<PathBuf>,
     /// Каталог, относительно которого разрешаются относительные пути.
     base_dir: Option<PathBuf>,
+    /// Локальные файлы выключены (HTTP-режим): любой путь отклоняется.
+    disabled: bool,
 }
+
+/// Сообщение для агента, когда локальные файлы выключены.
+pub const LOCAL_FILES_DISABLED: &str = "local files are not available: this server runs on \
+    another machine (HTTP mode) and cannot read or write files on the agent's machine";
 
 impl FilePolicy {
     /// Политика с корнями по умолчанию (рабочий каталог и временный каталог) и `extra`.
@@ -76,6 +86,7 @@ impl FilePolicy {
         let mut policy = Self {
             roots: Vec::new(),
             base_dir: None,
+            disabled: false,
         };
         for root in roots {
             let canonical = root.canonicalize().map_err(|err| {
@@ -93,6 +104,20 @@ impl FilePolicy {
             policy.push_root(canonical);
         }
         Ok(policy)
+    }
+
+    /// Политика без локальных файлов (HTTP-режим): любой путь отклоняется.
+    pub fn disabled() -> Self {
+        Self {
+            roots: Vec::new(),
+            base_dir: None,
+            disabled: true,
+        }
+    }
+
+    /// Выключены ли локальные файлы ([`FilePolicy::disabled`]).
+    pub fn is_disabled(&self) -> bool {
+        self.disabled
     }
 
     /// Каталог для относительных путей. По умолчанию — рабочий каталог на момент создания.
@@ -115,6 +140,7 @@ impl FilePolicy {
     /// Проверяет файл для чтения (загрузки). Возвращает канонический путь существующего
     /// обычного файла внутри разрешённого корня.
     pub fn check_read(&self, path: &str) -> Result<PathBuf, FilePolicyError> {
+        self.ensure_enabled()?;
         let absolute = self.absolute(path)?;
         let canonical = absolute
             .canonicalize()
@@ -130,6 +156,7 @@ impl FilePolicy {
     /// внутри разрешённого корня, файла с таким именем быть не должно (в том числе
     /// символической ссылки). Возвращает путь вида `<канонический каталог>/<имя файла>`.
     pub fn check_write(&self, path: &str) -> Result<PathBuf, FilePolicyError> {
+        self.ensure_enabled()?;
         let absolute = self.absolute(path)?;
         let file_name = match absolute.components().next_back() {
             Some(Component::Normal(name)) => name.to_owned(),
@@ -153,6 +180,13 @@ impl FilePolicy {
             )));
         }
         Ok(target)
+    }
+
+    fn ensure_enabled(&self) -> Result<(), FilePolicyError> {
+        if self.disabled {
+            return Err(FilePolicyError(LOCAL_FILES_DISABLED.to_owned()));
+        }
+        Ok(())
     }
 
     fn absolute(&self, path: &str) -> Result<PathBuf, FilePolicyError> {
@@ -194,14 +228,31 @@ impl FilePolicy {
 
     /// Список корней для сообщений и инструкций сервера.
     pub fn describe_roots(&self) -> String {
+        if self.disabled {
+            return "none (local files are disabled)".to_owned();
+        }
         if self.roots.is_empty() {
             return "none".to_owned();
         }
         self.roots
             .iter()
-            .map(|root| root.display().to_string())
+            .map(|root| display_path(root))
             .collect::<Vec<_>>()
             .join(", ")
+    }
+}
+
+/// Путь для сообщений агенту. На Windows `canonicalize` возвращает verbatim-пути
+/// (`\\?\C:\…`, `\\?\UNC\server\share\…`); агенту и пользователю показывается обычная
+/// запись. Проверки по-прежнему идут по каноническим путям.
+fn display_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(local) = text.strip_prefix(r"\\?\") {
+        local.to_owned()
+    } else {
+        text
     }
 }
 
@@ -344,5 +395,40 @@ mod tests {
         assert!(policy.roots().contains(&f.outside));
         let tmp = std::env::temp_dir().canonicalize().unwrap();
         assert!(policy.roots().contains(&tmp));
+    }
+
+    #[test]
+    fn disabled_policy_rejects_every_path() {
+        let f = fixture();
+        let policy = FilePolicy::disabled();
+        assert!(policy.is_disabled());
+        assert!(!f.policy.is_disabled());
+        let inside = s(&f.root.join("sub/file.txt"));
+        for err in [
+            policy.check_read(&inside).unwrap_err(),
+            policy
+                .check_write(&s(&f.root.join("sub/new.bin")))
+                .unwrap_err(),
+            policy.check_read("/etc/hosts").unwrap_err(),
+        ] {
+            assert_eq!(err.0, LOCAL_FILES_DISABLED);
+        }
+        assert!(policy.describe_roots().contains("disabled"));
+    }
+
+    #[test]
+    fn display_path_hides_windows_verbatim_prefix() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\Users\me\project")),
+            r"C:\Users\me\project"
+        );
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server\share\dir")),
+            r"\\server\share\dir"
+        );
+        assert_eq!(
+            display_path(Path::new("/home/me/project")),
+            "/home/me/project"
+        );
     }
 }

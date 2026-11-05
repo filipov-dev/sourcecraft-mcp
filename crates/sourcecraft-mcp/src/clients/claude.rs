@@ -33,7 +33,15 @@ pub struct SystemRunner;
 
 impl CommandRunner for SystemRunner {
     fn run(&mut self, program: &str, args: &[String]) -> io::Result<CommandOutput> {
-        let output = Command::new(program).args(args).output()?;
+        let output = match Command::new(program).args(args).output() {
+            // На Windows `Command` ищет в PATH только `<имя>.exe`, а установка Claude Code
+            // через npm кладёт обёртку `claude.cmd`. Rust экранирует аргументы для `.cmd`
+            // сам и отказывается запускать, если безопасно экранировать нельзя.
+            Err(err) if cfg!(windows) && err.kind() == io::ErrorKind::NotFound => {
+                Command::new(format!("{program}.cmd")).args(args).output()?
+            }
+            result => result?,
+        };
         Ok(CommandOutput {
             success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),

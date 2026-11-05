@@ -1,16 +1,19 @@
 //! `sourcecraft-mcp connect` — подключение сервера к MCP-клиенту.
 //!
-//! Сценарий: инструкция по созданию токена → скрытый ввод → проверка `GET /user` → токен в
-//! системное хранилище, настройки в `profiles.toml` → регистрация сервера в клиенте после
-//! подтверждения. Токен не попадает ни в аргументы, ни в конфигурацию клиента.
+//! Сценарий: инструкция по созданию токена и форма создания в браузере → скрытый ввод →
+//! проверка `GET /user` → токен в системное хранилище, настройки в `profiles.toml` →
+//! регистрация сервера в клиенте после подтверждения. Токен не попадает ни в аргументы, ни в
+//! конфигурацию клиента.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use clap::Args;
 use sourcecraft_api::auth::{KEYRING_SERVICE, KeyringStore, TokenStore};
+use sourcecraft_api::{AccessLevel, ApiToken};
 use sourcecraft_mcp_core::normalize_toolsets;
 
+use crate::browser::{BrowserDecision, BrowserEnv, SkipReason, TOKEN_FORM_URL, decide};
 use crate::clients::claude::{self, CommandRunner, SystemRunner};
 use crate::clients::{ClientKind, Scope, ServerSpec, codex};
 use crate::profiles::{ProfileRepo, ProfileSettings, validate_profile_name};
@@ -25,6 +28,9 @@ pub const PAT_DOCS_URL: &str = "https://sourcecraft.dev/portal/docs/en/sourcecra
 The token is read with hidden input and stored only in the system keychain \
 (macOS Keychain, Windows Credential Manager or Secret Service on Linux) under the profile name. \
 The client config gets only the command `sourcecraft-mcp serve --profile <profile> ...`.
+
+When a new token is needed, the token creation page opens in the default browser; over SSH, \
+without a graphical session or with --no-browser only its link is printed.
 
 Use a separate token and profile for every client, so each can be revoked on its own.")]
 pub struct ConnectArgs {
@@ -49,12 +55,19 @@ pub struct ConnectArgs {
     /// Let the agent ask to see repository secret values (`serve --allow-secret-values`).
     #[arg(long)]
     pub allow_secret_values: bool,
+    /// Start with only the search, request and toolset tools; the agent loads toolsets on
+    /// demand (`serve --dynamic-toolsets`). Needs a client that reloads the tool list.
+    #[arg(long)]
+    pub dynamic_toolsets: bool,
     /// Do not ask for confirmation before changing the client config.
     #[arg(long, short = 'y')]
     pub yes: bool,
     /// Store the token without checking it against the SourceCraft API.
     #[arg(long)]
     pub skip_check: bool,
+    /// Do not open the token creation page in a browser; only print its link.
+    #[arg(long)]
+    pub no_browser: bool,
 }
 
 pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
@@ -71,6 +84,7 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         ui: &mut TerminalUi,
         exe,
         codex_home,
+        browser: decide(args.no_browser, &BrowserEnv::current()),
     };
     connect(&mut env, &args).await
 }
@@ -84,12 +98,14 @@ pub struct ConnectEnv<'a, V> {
     pub ui: &'a mut dyn Ui,
     pub exe: PathBuf,
     pub codex_home: PathBuf,
+    /// Открывать ли форму создания токена в браузере (решается в `run` по флагу и окружению).
+    pub browser: BrowserDecision,
 }
 
-/// Инструкция по созданию токена в веб-интерфейсе SourceCraft.
+/// Инструкция по заполнению формы создания токена.
 ///
-/// Прямой адрес страницы токенов в документации SourceCraft не указан, поэтому даём путь
-/// по меню, а не угадываем URL.
+/// Форма не принимает параметров URL, а по умолчанию предлагает пустое имя, срок 1 день,
+/// доступ ко всем репозиториям и роль по умолчанию — поэтому подсказываем, что поменять.
 pub fn token_instructions(profile: &str, allow_write: bool) -> String {
     let roles = if allow_write {
         "the repository roles this agent needs to read and change data"
@@ -98,14 +114,50 @@ pub fn token_instructions(profile: &str, allow_write: bool) -> String {
     };
     format!(
         "Create a personal access token for profile `{profile}` in SourceCraft:\n\
-         \x20 1. Open https://sourcecraft.dev and sign in.\n\
-         \x20 2. In the left panel open Home -> Access -> Personal access tokens and click\n\
-         \x20    \"Generate new token\".\n\
-         \x20 3. Name it `mcp-{profile}`, pick an expiration date, repository access and\n\
-         \x20    {roles}.\n\
-         \x20 4. Click \"Generate token\" and copy the value: SourceCraft shows it only once.\n\
-         \x20 Docs: {PAT_DOCS_URL}"
+         \x20 {TOKEN_FORM_URL}\n\
+         \x20 - Name: mcp-{profile}\n\
+         \x20 - Expiration: longer than the default 1 day (up to 1 year)\n\
+         \x20 - Roles: {roles}\n\
+         \x20 - Repositories: optionally limit access to the ones the agent needs\n\
+         \x20 Click \"Generate token\" and copy the value: SourceCraft shows it only once.\n\
+         \x20 Roles reference: {PAT_DOCS_URL}"
     )
+}
+
+/// Запрашивает новый токен: инструкция, форма создания в браузере (если `browser` разрешает),
+/// скрытый ввод. Общий шаг `connect` и `auth login`.
+pub fn prompt_new_token(
+    ui: &mut dyn Ui,
+    profile: &str,
+    allow_write: bool,
+    browser: BrowserDecision,
+) -> anyhow::Result<ApiToken> {
+    // Ссылка печатается всегда, чтобы её можно было скопировать.
+    ui.say(&token_instructions(profile, allow_write));
+    match browser {
+        BrowserDecision::Open => match ui.open_url(TOKEN_FORM_URL) {
+            Ok(()) => ui.say("Opened the token creation page in your browser."),
+            Err(err) => ui.say(&format!(
+                "Could not open a browser ({err}); open the link above yourself."
+            )),
+        },
+        BrowserDecision::Skip(SkipReason::Ssh) => {
+            ui.say("SSH session: open the link above in a browser on your computer.");
+        }
+        BrowserDecision::Skip(SkipReason::NoDisplay) => {
+            ui.say("No graphical session: open the link above in a browser.");
+        }
+        BrowserDecision::Skip(SkipReason::Flag) => {}
+    }
+    let token = ui
+        .read_token(&format!(
+            "Paste the token for profile `{profile}` (input is hidden): "
+        ))
+        .context("failed to read the token")?;
+    if token.expose().is_empty() {
+        bail!("empty token; nothing was stored");
+    }
+    Ok(token)
 }
 
 pub async fn connect<V: TokenVerifier>(
@@ -125,7 +177,9 @@ pub async fn connect<V: TokenVerifier>(
         allow_destructive: args.allow_destructive,
         toolsets,
         allow_secret_values: args.allow_secret_values,
-    };
+        dynamic_toolsets: args.dynamic_toolsets,
+    }
+    .normalized();
     let spec = ServerSpec::new(&env.exe, &profile, &settings)?;
 
     // Проверки клиента — до ввода токена, чтобы не просить токен зря.
@@ -142,20 +196,12 @@ pub async fn connect<V: TokenVerifier>(
         ));
         env.store.get(&profile)?
     } else {
-        env.ui.say(&token_instructions(
+        prompt_new_token(
+            env.ui,
             &profile,
-            args.allow_write || args.allow_destructive,
-        ));
-        let token = env
-            .ui
-            .read_token(&format!(
-                "Paste the token for profile `{profile}` (input is hidden): "
-            ))
-            .context("failed to read the token")?;
-        if token.expose().is_empty() {
-            bail!("empty token; nothing was stored");
-        }
-        token
+            settings.access_level() != AccessLevel::Read,
+            env.browser,
+        )?
     };
 
     if args.skip_check {
@@ -222,6 +268,7 @@ mod tests {
         runner: FakeRunner,
         ui: ScriptedUi,
         codex_home: PathBuf,
+        browser: BrowserDecision,
     }
 
     impl Fixture {
@@ -236,6 +283,7 @@ mod tests {
                 runner: FakeRunner::default(),
                 ui: ScriptedUi::default(),
                 codex_home: dir.path().join("codex"),
+                browser: BrowserDecision::Skip(SkipReason::Flag),
                 _dir: dir,
             }
         }
@@ -247,8 +295,9 @@ mod tests {
                 verifier: &self.verifier,
                 runner: &mut self.runner,
                 ui: &mut self.ui,
-                exe: PathBuf::from("/usr/local/bin/sourcecraft-mcp"),
+                exe: PathBuf::from(crate::clients::TEST_EXE),
                 codex_home: self.codex_home.clone(),
+                browser: self.browser,
             };
             connect(&mut env, args).await
         }
@@ -263,8 +312,10 @@ mod tests {
             allow_destructive: false,
             toolsets: Vec::new(),
             allow_secret_values: false,
+            dynamic_toolsets: false,
             yes: false,
             skip_check: false,
+            no_browser: false,
         }
     }
 
@@ -296,6 +347,104 @@ mod tests {
         assert!(!output.contains("good-token"));
         assert!(!config.contains("good-token"));
         assert!(fx.runner.calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn access_flag_combinations() {
+        // (--allow-write, --allow-destructive) -> аргументы serve и сохранённые флаги.
+        let cases: [(bool, bool, &[&str]); 4] = [
+            (false, false, &[]),
+            (true, false, &["--allow-write"]),
+            (false, true, &["--allow-write", "--allow-destructive"]),
+            (true, true, &["--allow-write", "--allow-destructive"]),
+        ];
+        for (write, destructive, flags) in cases {
+            let mut fx = Fixture::new();
+            fx.ui.tokens = ["good-token".to_owned()].into();
+            let mut args = args(ClientKind::Codex);
+            args.allow_write = write;
+            args.allow_destructive = destructive;
+            args.yes = true;
+            fx.connect(&args).await.unwrap();
+
+            let settings = fx.repo.get("codex").unwrap().unwrap();
+            assert_eq!(settings.allow_write, write || destructive);
+            assert_eq!(settings.allow_destructive, destructive);
+
+            let mut expected = vec!["serve", "--profile", "codex"];
+            expected.extend_from_slice(flags);
+            let expected = format!("args = {expected:?}");
+            let config = fs::read_to_string(codex::config_path(&fx.codex_home)).unwrap();
+            assert!(config.contains(&expected), "{config}\nexpected: {expected}");
+
+            let mut ui = ScriptedUi::default();
+            crate::cli::auth::status(&fx.store, &fx.repo, &mut ui, "codex").unwrap();
+            let text = ui.text();
+            let yes_no = |value: bool| if value { "yes" } else { "no" };
+            assert!(text.contains(&format!("Write:    {}", yes_no(write || destructive))));
+            assert!(text.contains(&format!("Delete:   {}", yes_no(destructive))));
+        }
+    }
+
+    #[tokio::test]
+    async fn opens_token_form_in_browser() {
+        let mut fx = Fixture::new();
+        fx.browser = BrowserDecision::Open;
+        fx.ui.tokens = ["good-token".to_owned()].into();
+        let mut args = args(ClientKind::Codex);
+        args.yes = true;
+        fx.connect(&args).await.unwrap();
+        assert_eq!(fx.ui.opened, [TOKEN_FORM_URL]);
+        let text = fx.ui.text();
+        assert!(text.contains(TOKEN_FORM_URL), "{text}");
+        assert!(text.contains("Name: mcp-codex"), "{text}");
+        assert!(text.contains("Opened the token creation page"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn browser_failure_or_ssh_only_prints_link() {
+        let mut fx = Fixture::new();
+        fx.browser = BrowserDecision::Open;
+        fx.ui.open_fails = true;
+        fx.ui.tokens = ["good-token".to_owned()].into();
+        let mut args = args(ClientKind::Codex);
+        args.yes = true;
+        fx.connect(&args).await.unwrap();
+        let text = fx.ui.text();
+        assert!(text.contains(TOKEN_FORM_URL), "{text}");
+        assert!(text.contains("Could not open a browser"), "{text}");
+        assert!(fx.store.contains("codex").unwrap());
+
+        let mut fx = Fixture::new();
+        fx.browser = BrowserDecision::Skip(SkipReason::Ssh);
+        fx.ui.tokens = ["good-token".to_owned()].into();
+        fx.connect(&args).await.unwrap();
+        assert!(fx.ui.opened.is_empty());
+        let text = fx.ui.text();
+        assert!(text.contains(TOKEN_FORM_URL), "{text}");
+        assert!(text.contains("SSH session"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn stored_token_does_not_open_browser() {
+        let mut fx = Fixture::new();
+        fx.browser = BrowserDecision::Open;
+        fx.store.set("codex", &ApiToken::new("good-token")).unwrap();
+        let mut args = args(ClientKind::Codex);
+        args.yes = true;
+        fx.connect(&args).await.unwrap();
+        assert!(fx.ui.opened.is_empty());
+    }
+
+    #[test]
+    fn instructions_name_roles_and_expiry() {
+        let read = token_instructions("codex", false);
+        assert!(read.contains("mcp-codex"));
+        assert!(read.contains("read-only repository roles"));
+        assert!(read.contains("1 day"));
+        assert!(read.contains(PAT_DOCS_URL));
+        let write = token_instructions("codex", true);
+        assert!(write.contains("read and change data"));
     }
 
     #[tokio::test]
@@ -353,7 +502,7 @@ mod tests {
                 claude::add_args(
                     Scope::Project,
                     &ServerSpec {
-                        command: "/usr/local/bin/sourcecraft-mcp".into(),
+                        command: crate::clients::TEST_EXE.into(),
                         args: vec!["serve".into(), "--profile".into(), "claude-code".into()],
                     }
                 )

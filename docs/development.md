@@ -6,11 +6,11 @@
 | --- | --- |
 | `crates/sourcecraft-api` | Спецификация SourceCraft, генератор таблицы операций (`build.rs`), исполнитель HTTP-запросов, хранилище токенов. |
 | `crates/sourcecraft-mcp-core` | MCP-инструменты: реестр, уровни доступа, наборы, `api_request`, `api_search`, `secret_set`, вырезание секретов, политика файлов. Не зависит от транспорта. |
-| `crates/sourcecraft-mcp` | Бинарник: CLI (`serve`, `connect`, `auth`, `secret`, `toolsets`) и транспорт stdio. |
+| `crates/sourcecraft-mcp` | Бинарник: CLI (`serve`, `connect`, `auth`, `secret`, `toolsets`, `tools`) и транспорты stdio и HTTP (`src/cli/serve/http_server.rs`). |
 
 ## Сборка и проверки
 
-Нужен Rust 1.88 или новее; `rust-toolchain.toml` выбирает стабильный канал с `rustfmt` и `clippy`. В Linux нужны `pkg-config` и `libdbus-1-dev`.
+Нужен Rust 1.88 или новее; `rust-toolchain.toml` выбирает стабильный канал с `rustfmt` и `clippy`. Для крейта `aws-lc-sys` (криптография TLS) нужен C-компилятор; системные библиотеки D-Bus и OpenSSL не нужны.
 
 ```bash
 cargo build --release
@@ -20,6 +20,19 @@ cargo test
 ```
 
 Тесты не обращаются к реальному SourceCraft API (HTTP подменяется `wiremock`) и не используют системное хранилище токенов.
+
+### Windows
+
+Сборка — нативная, целевая платформа `x86_64-pc-windows-msvc`: нужны Visual Studio Build Tools с компонентом «Разработка классических приложений на C++» и `rustup`. Релизный бинарник собирается со статическим CRT, чтобы на машине пользователя не требовался Visual C++ Redistributable:
+
+```powershell
+$env:RUSTFLAGS = '-C target-feature=+crt-static'
+cargo build --release --locked --target x86_64-pc-windows-msvc -p sourcecraft-mcp
+cargo clippy --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
+cargo test --locked --target x86_64-pc-windows-msvc
+```
+
+Ветки кода для Windows (хранилище токенов в Credential Manager, запуск `claude.cmd`, права файлов в `secret write`) компилируются или выполняются только там, поэтому проверяйте изменения в них этими командами. С macOS и Linux `cargo check --target x86_64-pc-windows-msvc` без Windows SDK не проходит: C-код `aws-lc-sys` требует заголовков Windows.
 
 Запустить CLI из исходников:
 

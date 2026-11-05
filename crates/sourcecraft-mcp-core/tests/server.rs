@@ -37,7 +37,7 @@ async fn start_with(
 ) -> (RunningService<RoleClient, ()>, tokio::task::JoinHandle<()>) {
     let client = ApiClient::new(ClientConfig {
         base_url: api.uri().parse().unwrap(),
-        token: ApiToken::new(TEST_TOKEN),
+        token: Some(ApiToken::new(TEST_TOKEN)),
         timeout: Duration::from_secs(10),
         max_response_bytes: 64 * 1024,
     })
@@ -493,4 +493,308 @@ async fn secret_set_encodes_value() {
 
     client.cancel().await.unwrap();
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn jq_filter_runs_after_redaction_and_before_size_limit() {
+    let api = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/web/pulls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "pull_requests": [
+                {"id": "pr-1", "title": "Fix", "description": "long text", "author": {"slug": "a"}},
+                {"id": "pr-2", "title": "Docs", "description": "more text", "author": {"slug": "b"}}
+            ],
+            "next_page_token": ""
+        })))
+        .mount(&api)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/web/secrets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(secrets_body()))
+        .mount(&api)
+        .await;
+    // Ответ больше лимита сервера (64 KiB): без фильтра обрезается, фильтр видит его целиком.
+    let items: Vec<Value> = (0..2000)
+        .map(|i| json!({"id": i, "payload": "x".repeat(100)}))
+        .collect();
+    Mock::given(method("GET"))
+        .and(path("/big"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": items})))
+        .mount(&api)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/text"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("plain", "text/plain"))
+        .mount(&api)
+        .await;
+    let (client, server) = start(&api, AccessLevel::Read).await;
+
+    let tools = client.list_all_tools().await.unwrap();
+    for name in ["list_repository_pull_requests", "api_request"] {
+        let tool = tools.iter().find(|t| t.name == name).unwrap();
+        assert!(
+            tool.input_schema["properties"].get("jq").is_some(),
+            "{name}"
+        );
+    }
+
+    // Только выбранные поля.
+    let result = call(
+        &client,
+        "list_repository_pull_requests",
+        json!({"org_slug": "acme", "repo_slug": "web", "jq": ".pull_requests[] | {id, title}"}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(false), "{}", text(&result));
+    assert_eq!(
+        text(&result),
+        r#"[{"id":"pr-1","title":"Fix"},{"id":"pr-2","title":"Docs"}]"#
+    );
+
+    // Фильтр получает уже очищенный ответ: значения секретов ему недоступны.
+    for filter in [".. | strings", "[.secrets[].value | @base64d?]", "tojson"] {
+        let result = call(
+            &client,
+            "list_secrets",
+            json!({"org_slug": "acme", "repo_slug": "web", "jq": filter}),
+        )
+        .await;
+        assert_eq!(result.is_error, Some(false), "{}", text(&result));
+        let filtered = text(&result);
+        assert!(
+            !filtered.contains("ZGVwbG95LXZhbHVl") && !filtered.contains("ZXUtd2VzdA=="),
+            "{filtered}"
+        );
+        assert!(!filtered.contains("deploy-value"), "{filtered}");
+        assert!(filtered.contains("were replaced"), "{filtered}");
+    }
+
+    // Ошибка разбора — до запроса в API.
+    let before = api.received_requests().await.unwrap().len();
+    for bad in [json!(".pull_requests["), json!("env"), json!(42)] {
+        let result = call(
+            &client,
+            "list_repository_pull_requests",
+            json!({"org_slug": "acme", "repo_slug": "web", "jq": bad}),
+        )
+        .await;
+        assert!(error_text(&result).contains("argument `jq`"));
+    }
+    assert_eq!(api.received_requests().await.unwrap().len(), before);
+
+    // Ошибка выполнения — управляемая, с пояснением, что запрос выполнен.
+    let result = call(
+        &client,
+        "list_repository_pull_requests",
+        json!({"org_slug": "acme", "repo_slug": "web", "jq": ".pull_requests[] | .title.x"}),
+    )
+    .await;
+    let message = error_text(&result);
+    assert!(
+        message.contains("the API request succeeded (HTTP 200)"),
+        "{message}"
+    );
+    assert!(message.contains("cannot index"), "{message}");
+
+    // Лимит размера — после фильтра.
+    let result = call(
+        &client,
+        "api_request",
+        json!({"method": "GET", "path": "/big"}),
+    )
+    .await;
+    assert!(text(&result).contains("truncated"));
+    let result = call(
+        &client,
+        "api_request",
+        json!({"method": "GET", "path": "/big", "jq": "[.items[].id] | length"}),
+    )
+    .await;
+    assert_eq!(text(&result), "2000");
+    let result = call(
+        &client,
+        "api_request",
+        json!({"method": "GET", "path": "/big", "jq": ".items[]"}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(false));
+    let filtered = text(&result);
+    assert!(filtered.starts_with(r#"[{"id":0,"#), "{}", &filtered[..50]);
+    assert!(filtered.contains("truncated"));
+    assert!(filtered.len() < 64 * 1024 + 500, "{}", filtered.len());
+
+    // Ответ не в JSON возвращается без фильтра, с пояснением.
+    let result = call(
+        &client,
+        "api_request",
+        json!({"method": "GET", "path": "/text", "jq": ".a"}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(false));
+    let plain = text(&result);
+    assert!(plain.starts_with("plain"), "{plain}");
+    assert!(plain.contains("not JSON"), "{plain}");
+
+    client.cancel().await.unwrap();
+    server.await.unwrap();
+}
+
+/// Токен в расширениях запроса, как его кладёт HTTP-транспорт бинарника.
+#[derive(Clone)]
+struct TestRequestToken(ApiToken);
+
+#[tokio::test]
+async fn per_request_token_is_taken_from_each_call() {
+    use std::sync::Arc;
+
+    use rmcp::model::Extensions;
+    use sourcecraft_mcp_core::TokenSource;
+
+    let api = MockServer::start().await;
+    for token in ["agent-one-token", "agent-two-token"] {
+        Mock::given(method("GET"))
+            .and(path("/user"))
+            .and(header("authorization", format!("Bearer {token}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"login": token})))
+            .expect(1)
+            .mount(&api)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .and(header("authorization", "Bearer echo-me-token"))
+        .respond_with(
+            ResponseTemplate::new(401).set_body_string(r#"{"message":"bad token echo-me-token"}"#),
+        )
+        .expect(1)
+        .mount(&api)
+        .await;
+
+    let client = ApiClient::new(ClientConfig {
+        base_url: api.uri().parse().unwrap(),
+        token: None,
+        timeout: Duration::from_secs(10),
+        max_response_bytes: 64 * 1024,
+    })
+    .unwrap();
+    let server = SourceCraftServer::with_token_source(
+        client,
+        ServerOptions {
+            local_machine: false,
+            ..ServerOptions::default()
+        },
+        FilePolicy::new(&[]).unwrap(),
+        TokenSource::PerRequest(Arc::new(|ext: &Extensions| {
+            ext.get::<TestRequestToken>().map(|t| t.0.clone())
+        })),
+    )
+    .unwrap();
+
+    let call = |token: Option<&str>| {
+        let mut ext = Extensions::new();
+        if let Some(token) = token {
+            ext.insert(TestRequestToken(ApiToken::new(token)));
+        }
+        let server = server.clone();
+        async move {
+            server
+                .call_with_extensions("get_my_profile", JsonObject::new(), &ext)
+                .await
+                .unwrap()
+        }
+    };
+
+    for token in ["agent-one-token", "agent-two-token"] {
+        let result = call(Some(token)).await;
+        assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    }
+
+    let missing = call(None).await;
+    assert_eq!(missing.is_error, Some(true));
+    assert!(
+        text(&missing).contains("Authorization: Bearer"),
+        "{}",
+        text(&missing)
+    );
+
+    let echoed = call(Some("echo-me-token")).await;
+    assert_eq!(echoed.is_error, Some(true));
+    assert!(text(&echoed).contains("HTTP 401"), "{}", text(&echoed));
+    assert!(
+        !text(&echoed).contains("echo-me-token"),
+        "{}",
+        text(&echoed)
+    );
+
+    // Поиск по операциям не требует токена.
+    let search = server
+        .call_with_extensions(
+            "api_search",
+            args(json!({"query": "profile"})),
+            &Extensions::new(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(search.is_error, Some(true), "{}", text(&search));
+}
+
+/// В HTTP-режиме фильтр `jq` получает ответ, из которого уже вырезан токен запроса:
+/// преобразование (`@base64`, ключи объекта) не выводит токен мимо итоговой очистки.
+#[tokio::test]
+async fn jq_filter_in_http_mode_sees_scrubbed_request_token() {
+    use std::sync::Arc;
+
+    use rmcp::model::Extensions;
+    use sourcecraft_mcp_core::TokenSource;
+
+    let token = "jq-agent-token";
+    let api = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .and(header("authorization", format!("Bearer {token}").as_str()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"login": "agent", "echo": token, token: 1})),
+        )
+        .expect(1)
+        .mount(&api)
+        .await;
+
+    let client = ApiClient::new(ClientConfig {
+        base_url: api.uri().parse().unwrap(),
+        token: None,
+        timeout: Duration::from_secs(10),
+        max_response_bytes: 64 * 1024,
+    })
+    .unwrap();
+    let server = SourceCraftServer::with_token_source(
+        client,
+        ServerOptions {
+            local_machine: false,
+            ..ServerOptions::default()
+        },
+        FilePolicy::new(&[]).unwrap(),
+        TokenSource::PerRequest(Arc::new(|ext: &Extensions| {
+            ext.get::<TestRequestToken>().map(|t| t.0.clone())
+        })),
+    )
+    .unwrap();
+
+    let mut ext = Extensions::new();
+    ext.insert(TestRequestToken(ApiToken::new(token)));
+    let result = server
+        .call_with_extensions(
+            "get_my_profile",
+            args(json!({"jq": "{login, encoded: (.echo | @base64), keys: (keys | map(@base64))}"})),
+            &ext,
+        )
+        .await
+        .unwrap();
+    let output = text(&result);
+    assert_ne!(result.is_error, Some(true), "{output}");
+    assert!(output.contains("\"agent\""), "{output}");
+    assert!(!output.contains(token), "{output}");
+    // base64 от токена.
+    assert!(!output.contains("anEtYWdlbnQtdG9rZW4"), "{output}");
 }

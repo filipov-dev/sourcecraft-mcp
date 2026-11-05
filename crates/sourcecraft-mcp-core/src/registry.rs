@@ -9,6 +9,18 @@
 //! добавляются вариантами [`ToolKind`] и регистрируются здесь же.
 //! `api_request` и `api_search` регистрируются всегда: наборы инструментов их не ограничивают.
 //! `secret_set` — только при уровне и наборе заменяемой им операции `set_secret`.
+//! Пользовательские инструменты ([`crate::custom_tools`]) регистрируются по уровню доступа,
+//! без учёта наборов (и в динамическом режиме — сразу при запуске); совпадение имени
+//! со встроенным инструментом — ошибка запуска.
+//!
+//! Без [`ServerOptions::local_machine`] (HTTP-режим) операции с файловыми аргументами
+//! (загрузка вложений) не регистрируются, а из схем `api_request` и `secret_set` убираются
+//! аргументы с локальными путями.
+//!
+//! В режиме динамических наборов (`ServerOptions::dynamic_toolsets`) реестр — снимок для
+//! текущего списка включённых наборов: сервер пересобирает его через
+//! [`ToolRegistry::with_toolsets`] при `enable_toolset`/`disable_toolset`. Пустой список
+//! в этом режиме означает «ни одного набора», а не «все».
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,8 +29,14 @@ use rmcp::model::{JsonObject, Tool, ToolAnnotations};
 use sourcecraft_api::spec::{AccessLevel, OperationDef, ParamType, find, operations};
 
 use crate::ServerOptions;
-use crate::api_request::api_request_tool;
+use crate::api_request::{api_request_tool, without_local_files};
 use crate::api_search::api_search_tool;
+use crate::custom_tools::check_names;
+use crate::dynamic_toolsets::{
+    ENABLE_TOOLSET_TOOL, disable_toolset_tool, enable_toolset_tool, list_toolsets_tool,
+};
+use crate::jq::{JQ_ARG, add_jq_argument};
+use crate::secret_copy::{KeychainMode, SECRET_COPY_TOOL, secret_copy_tool};
 use crate::secrets::{
     SECRET_SET_TOOL, SET_SECRET_OPERATION, annotate_operation_tool, secret_set_tool,
 };
@@ -42,6 +60,16 @@ pub enum ToolKind {
     ApiSearch,
     /// `secret_set`: запись секрета из открытого текста или файла.
     SecretSet,
+    /// `secret_copy`: копирование секрета без раскрытия значения.
+    SecretCopy,
+    /// Пользовательский инструмент: индекс в `ServerOptions::custom_tools`.
+    Custom(usize),
+    /// `list_toolsets`: наборы инструментов и какие из них включены (динамический режим).
+    ListToolsets,
+    /// `enable_toolset`: включить набор (динамический режим).
+    EnableToolset,
+    /// `disable_toolset`: выключить набор (динамический режим).
+    DisableToolset,
 }
 
 /// Зарегистрированный инструмент: описание для `tools/list` и обработчик.
@@ -57,33 +85,103 @@ pub struct RegisteredTool {
 pub struct ToolRegistry {
     tools: Vec<RegisteredTool>,
     index: HashMap<String, usize>,
-    /// Выбранные наборы (slug); `None` — все.
+    /// Выбранные наборы (slug); `None` — все. В динамическом режиме всегда `Some`.
     toolsets: Option<Vec<String>>,
     max_access: AccessLevel,
+    allow_secret_values: bool,
+    dynamic: bool,
+    /// Пользовательские инструменты не выше уровня сервера. Наборы их не ограничивают,
+    /// поэтому при пересборке реестра (`with_toolsets`) они переносятся как есть.
+    custom: Vec<RegisteredTool>,
+    /// Пользовательские инструменты выше уровня сервера: имя → нужный уровень.
+    disabled_custom: HashMap<String, AccessLevel>,
+    /// Инструменты могут работать с локальными файлами ([`ServerOptions::local_machine`]).
+    local_files: bool,
+    /// Источники `keychain://` в `secret_copy` ([`ServerOptions::keychain_mode`]): от этого
+    /// зависит описание инструмента.
+    keychain_mode: KeychainMode,
+}
+
+/// Принимает ли операция локальный файл (загрузка вложений через multipart).
+pub fn takes_local_file(op: &OperationDef) -> bool {
+    op.params
+        .iter()
+        .any(|param| param.value_type == ParamType::File)
 }
 
 impl ToolRegistry {
     /// Строит реестр. Ошибка — неизвестный набор инструментов или некорректная схема
     /// в сгенерированной таблице (последнее — ошибка генератора).
     pub fn new(options: &ServerOptions) -> Result<Self, String> {
-        let toolsets = match &options.toolsets {
-            Some(names) => {
-                let names = normalize_toolsets(names)?;
-                (!names.is_empty()).then_some(names)
-            }
-            None => None,
+        let names = match &options.toolsets {
+            Some(names) => normalize_toolsets(names)?,
+            None => Vec::new(),
         };
-
-        let mut registry = Self {
+        let toolsets = if options.dynamic_toolsets {
+            Some(names)
+        } else {
+            (!names.is_empty()).then_some(names)
+        };
+        check_names(&options.custom_tools)?;
+        let mut custom = Vec::new();
+        let mut disabled_custom = HashMap::new();
+        for (index, tool) in options.custom_tools.iter().enumerate() {
+            if options.max_access.allows(tool.access) {
+                custom.push(RegisteredTool {
+                    tool: tool.tool(),
+                    kind: ToolKind::Custom(index),
+                    access: tool.access,
+                });
+            } else {
+                disabled_custom.insert(tool.name.clone(), tool.access);
+            }
+        }
+        Self {
             tools: Vec::new(),
             index: HashMap::new(),
             toolsets,
             max_access: options.max_access,
-        };
+            allow_secret_values: options.allow_secret_values,
+            dynamic: options.dynamic_toolsets,
+            custom,
+            disabled_custom,
+            local_files: options.local_machine,
+            keychain_mode: options.keychain_mode(),
+        }
+        .populate()
+    }
+
+    /// Тот же реестр с другим списком включённых наборов (динамический режим).
+    /// Ошибка — неизвестный набор.
+    pub fn with_toolsets(&self, toolsets: &[String]) -> Result<Self, String> {
+        let toolsets = normalize_toolsets(toolsets)?;
+        Self {
+            tools: Vec::new(),
+            index: HashMap::new(),
+            toolsets: if self.dynamic {
+                Some(toolsets)
+            } else {
+                (!toolsets.is_empty()).then_some(toolsets)
+            },
+            max_access: self.max_access,
+            allow_secret_values: self.allow_secret_values,
+            dynamic: self.dynamic,
+            custom: self.custom.clone(),
+            disabled_custom: self.disabled_custom.clone(),
+            local_files: self.local_files,
+            keychain_mode: self.keychain_mode,
+        }
+        .populate()
+    }
+
+    /// Заполняет пустой реестр инструментами по его настройкам.
+    fn populate(self) -> Result<Self, String> {
+        let mut registry = self;
+        let max_access = registry.max_access;
         for op in operations() {
             if registry.operation_enabled(op) {
                 let mut tool = operation_tool(op)?;
-                annotate_operation_tool(op, &mut tool, options.allow_secret_values);
+                annotate_operation_tool(op, &mut tool, registry.allow_secret_values);
                 registry.push(RegisteredTool {
                     tool,
                     kind: ToolKind::Operation(op),
@@ -97,9 +195,21 @@ impl ToolRegistry {
             && registry.toolset_enabled(op.tag)
         {
             registry.push(RegisteredTool {
-                tool: secret_set_tool(op)?,
+                tool: secret_set_tool(op, registry.local_files)?,
                 kind: ToolKind::SecretSet,
                 access: op.access,
+            });
+        }
+        // `secret_copy` создаёт новые ключи на уровне записи (перезапись проверяется при вызове)
+        // и относится к набору секретов, как `set_secret`.
+        if let Some(op) = find(SET_SECRET_OPERATION)
+            && registry.max_access.allows(AccessLevel::Write)
+            && registry.toolset_enabled(op.tag)
+        {
+            registry.push(RegisteredTool {
+                tool: secret_copy_tool(max_access, registry.keychain_mode),
+                kind: ToolKind::SecretCopy,
+                access: AccessLevel::Write,
             });
         }
         registry.push(RegisteredTool {
@@ -107,11 +217,35 @@ impl ToolRegistry {
             kind: ToolKind::ApiSearch,
             access: AccessLevel::Read,
         });
+        let mut api_request = api_request_tool(max_access);
+        if !registry.local_files {
+            without_local_files(&mut api_request);
+        }
         registry.push(RegisteredTool {
-            tool: api_request_tool(options.max_access),
+            tool: api_request,
             kind: ToolKind::ApiRequest,
-            access: options.max_access,
+            access: max_access,
         });
+        if registry.dynamic {
+            // Управление наборами меняет только список инструментов этого сервера,
+            // данных SourceCraft не касается — уровень чтения.
+            for (tool, kind) in [
+                (list_toolsets_tool(), ToolKind::ListToolsets),
+                (enable_toolset_tool(), ToolKind::EnableToolset),
+                (disable_toolset_tool(), ToolKind::DisableToolset),
+            ] {
+                registry.push(RegisteredTool {
+                    tool,
+                    kind,
+                    access: AccessLevel::Read,
+                });
+            }
+        }
+        // Пользовательские инструменты оператор настроил явно: они регистрируются всегда,
+        // в том числе в динамическом режиме, и не входят ни в один набор.
+        for tool in registry.custom.clone() {
+            registry.push(tool);
+        }
         Ok(registry)
     }
 
@@ -119,6 +253,12 @@ impl ToolRegistry {
         !EXCLUDED_OPERATIONS.contains(&op.tool_name)
             && self.max_access.allows(op.access)
             && self.toolset_enabled(op.tag)
+            && (self.local_files || !takes_local_file(op))
+    }
+
+    /// Могут ли инструменты работать с локальными файлами (см. [`ServerOptions::local_machine`]).
+    pub fn local_files(&self) -> bool {
+        self.local_files
     }
 
     /// Включён ли набор инструментов с тегом `tag`.
@@ -130,6 +270,16 @@ impl ToolRegistry {
             }
             None => true,
         }
+    }
+
+    /// Включённые наборы (slug); `None` — все (только в обычном режиме).
+    pub fn enabled_toolsets(&self) -> Option<&[String]> {
+        self.toolsets.as_deref()
+    }
+
+    /// Режим динамических наборов: наборы включаются инструментом `enable_toolset`.
+    pub fn is_dynamic(&self) -> bool {
+        self.dynamic
     }
 
     /// Максимальный уровень доступа сервера.
@@ -167,8 +317,28 @@ impl ToolRegistry {
 
     /// Почему известный инструмент не зарегистрирован; `None` — инструмент неизвестен.
     pub fn unavailable_reason(&self, name: &str) -> Option<String> {
+        if let Some(&access) = self.disabled_custom.get(name) {
+            return Some(format!(
+                "custom tool `{name}` is disabled: it {} data in SourceCraft and the server runs \
+                 with {} access. Ask the user to restart the server with {} if this is intended",
+                access_verb(access),
+                access_name(self.max_access),
+                access_flag(access),
+            ));
+        }
         if name == SECRET_SET_TOOL {
             return self.disabled_reason(name, find(SET_SECRET_OPERATION)?);
+        }
+        if name == SECRET_COPY_TOOL {
+            let op = find(SET_SECRET_OPERATION)?;
+            if !self.max_access.allows(AccessLevel::Write) {
+                return Some(format!(
+                    "tool `{name}` is disabled: it writes secrets in SourceCraft and the server \
+                     runs with read-only access. Ask the user to restart the server with \
+                     --allow-write if this change is intended"
+                ));
+            }
+            return self.toolset_reason(name, op.tag);
         }
         let op = find(name)?;
         if EXCLUDED_OPERATIONS.contains(&op.tool_name) {
@@ -183,6 +353,14 @@ impl ToolRegistry {
 
     /// Почему инструмент с уровнем и набором операции `op` не зарегистрирован.
     fn disabled_reason(&self, name: &str, op: &OperationDef) -> Option<String> {
+        if !self.local_files && takes_local_file(op) {
+            return Some(format!(
+                "tool `{name}` is not available on this server: it uploads a local file, and this \
+                 server runs on another machine (HTTP mode) and cannot read the agent's files. \
+                 Ask the user to upload the file in SourceCraft or to use a local (stdio) \
+                 `sourcecraft-mcp serve` for uploads"
+            ));
+        }
         if !self.max_access.allows(op.access) {
             let flag = match op.access {
                 AccessLevel::Destructive => "--allow-destructive",
@@ -195,21 +373,49 @@ impl ToolRegistry {
                 access_name(self.max_access),
             ));
         }
-        if !self.toolset_enabled(op.tag) {
+        self.toolset_reason(name, op.tag)
+    }
+
+    /// Почему инструмент набора с тегом `tag` не зарегистрирован, если набор выключен.
+    fn toolset_reason(&self, name: &str, tag: &str) -> Option<String> {
+        if self.toolset_enabled(tag) {
+            return None;
+        }
+        let slug = toolset_slug(tag);
+        if !self.dynamic {
             return Some(format!(
-                "tool `{name}` belongs to toolset `{}`, which is not enabled; ask the user to add \
-                 it to --toolsets",
-                toolset_slug(op.tag)
+                "tool `{name}` belongs to toolset `{slug}`, which is not enabled; ask the user to \
+                 add it to --toolsets"
             ));
         }
-        None
+        // `secret_set` и `secret_copy` — не операции API, у них нет пути для `api_request`.
+        let fallback = if find(name).is_some() {
+            ", or call the same operation with `api_request`"
+        } else {
+            ""
+        };
+        Some(format!(
+            "tool `{name}` belongs to toolset `{slug}`, which is not enabled: call \
+             `{ENABLE_TOOLSET_TOOL}` with `toolset: \"{slug}\"` first{fallback}"
+        ))
     }
 }
 
 /// Описание MCP-инструмента для операции.
 pub fn operation_tool(op: &'static OperationDef) -> Result<Tool, String> {
-    let schema: JsonObject = serde_json::from_str(op.input_schema)
+    let mut schema: JsonObject = serde_json::from_str(op.input_schema)
         .map_err(|err| format!("{}: invalid input schema: {err}", op.tool_name))?;
+    if schema
+        .get("properties")
+        .and_then(|p| p.get(JQ_ARG))
+        .is_some()
+    {
+        return Err(format!(
+            "{}: parameter `{JQ_ARG}` clashes with the response filter argument",
+            op.tool_name
+        ));
+    }
+    add_jq_argument(&mut schema);
 
     let mut description = op.summary.trim().to_owned();
     let details = op.description.trim();
@@ -223,11 +429,7 @@ pub fn operation_tool(op: &'static OperationDef) -> Result<Tool, String> {
         description.push_str("\n\n");
         description.push_str(addressing);
     }
-    if op
-        .params
-        .iter()
-        .any(|param| param.value_type == ParamType::File)
-    {
+    if takes_local_file(op) {
         description.push_str(
             "\n\nFile arguments take a path to a local file inside the directories allowed by the \
              server (see the server instructions).",
@@ -325,6 +527,11 @@ mod tests {
                 op.tool_name
             );
             assert!(tool.description.is_some_and(|d| d.contains("Access: ")));
+            assert!(
+                tool.input_schema["properties"].get(JQ_ARG).is_some(),
+                "{}",
+                op.tool_name
+            );
         }
     }
 
@@ -347,16 +554,57 @@ mod tests {
         assert!(write.get("delete_repository").is_none());
 
         let all = ToolRegistry::new(&options(AccessLevel::Destructive, None)).unwrap();
-        // Плюс `secret_set`, который регистрируется только при `Destructive`.
+        // Плюс `secret_set` (только при `Destructive`) и `secret_copy` (с `Write`).
         assert_eq!(
             all.len(),
-            operations().len() - EXCLUDED_OPERATIONS.len() + EXTRA_TOOLS + 1
+            operations().len() - EXCLUDED_OPERATIONS.len() + EXTRA_TOOLS + 2
         );
+        assert_eq!(write.len(), count(AccessLevel::Write) + EXTRA_TOOLS + 1);
         let delete = all.get("delete_repository").unwrap();
         let annotations = delete.tool.annotations.as_ref().unwrap();
         assert_eq!(annotations.read_only_hint, Some(false));
         assert_eq!(annotations.destructive_hint, Some(true));
         assert!(read.len() < write.len() && write.len() < all.len());
+    }
+
+    #[test]
+    fn remote_server_has_no_local_file_tools() {
+        let remote = ToolRegistry::new(&ServerOptions {
+            local_machine: false,
+            ..options(AccessLevel::Destructive, None)
+        })
+        .unwrap();
+        assert!(!remote.local_files());
+        let uploads: Vec<&str> = operations()
+            .iter()
+            .filter(|op| takes_local_file(op))
+            .map(|op| op.tool_name)
+            .collect();
+        assert!(!uploads.is_empty());
+        for name in &uploads {
+            assert!(remote.get(name).is_none(), "{name}");
+            let reason = remote.unavailable_reason(name).unwrap();
+            assert!(reason.contains("HTTP mode"), "{reason}");
+        }
+        assert_eq!(
+            operation_tools(&remote),
+            count(AccessLevel::Destructive) - uploads.len()
+        );
+        // Ни в одной схеме нет аргументов с локальными путями.
+        for tool in remote.iter() {
+            let schema = serde_json::Value::Object((*tool.tool.input_schema).clone()).to_string();
+            for arg in ["body_file", "save_to", "value_file"] {
+                assert!(!schema.contains(arg), "{}: {arg}", tool.tool.name);
+            }
+            let description = tool.tool.description.as_deref().unwrap_or_default();
+            assert!(!description.contains("local file"), "{}", tool.tool.name);
+        }
+        assert!(remote.get("secret_set").is_some());
+        assert!(remote.get("api_request").is_some());
+
+        let local = ToolRegistry::new(&options(AccessLevel::Destructive, None)).unwrap();
+        assert!(local.local_files());
+        assert!(uploads.iter().all(|name| local.get(name).is_some()));
     }
 
     #[test]
@@ -389,6 +637,25 @@ mod tests {
             ToolRegistry::new(&options(AccessLevel::Destructive, Some(&["issues"]))).unwrap();
         assert!(issues.get("secret_set").is_none());
         let reason = issues.unavailable_reason("secret_set").unwrap();
+        assert!(reason.contains("toolset `secrets`"), "{reason}");
+    }
+
+    #[test]
+    fn secret_copy_requires_write_access_and_secrets_toolset() {
+        let read = ToolRegistry::new(&options(AccessLevel::Read, None)).unwrap();
+        assert!(read.get("secret_copy").is_none());
+        let reason = read.unavailable_reason("secret_copy").unwrap();
+        assert!(reason.contains("--allow-write"), "{reason}");
+
+        let write = ToolRegistry::new(&options(AccessLevel::Write, None)).unwrap();
+        let tool = write.get("secret_copy").unwrap();
+        assert!(matches!(tool.kind, ToolKind::SecretCopy));
+        assert_eq!(tool.access, AccessLevel::Write);
+        assert!(write.unavailable_reason("secret_copy").is_none());
+
+        let issues = ToolRegistry::new(&options(AccessLevel::Write, Some(&["issues"]))).unwrap();
+        assert!(issues.get("secret_copy").is_none());
+        let reason = issues.unavailable_reason("secret_copy").unwrap();
         assert!(reason.contains("toolset `secrets`"), "{reason}");
     }
 

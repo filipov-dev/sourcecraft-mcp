@@ -1,0 +1,24 @@
+# Пример запуска sourcecraft-mcp в HTTP-режиме (docs/http.md).
+#
+#   docker compose up --build -d
+#   curl http://127.0.0.1:8765/health
+#
+# Токенов здесь нет: каждый агент передаёт свой токен SourceCraft в заголовке
+# Authorization в конфигурации своего MCP-клиента.
+services:
+  sourcecraft-mcp:
+    build: .
+    image: sourcecraft-mcp:local
+    # Флаги serve: уровень доступа, наборы инструментов и т. п. добавляйте сюда,
+    # например --allow-write или --toolsets issues,pull-requests.
+    command: ["serve", "--http", "--listen", "0.0.0.0:8765"]
+    ports:
+      # Только loopback хоста. Для доступа с других машин поставьте перед сервером
+      # reverse proxy с TLS и добавьте его имя через --allowed-host.
+      - "127.0.0.1:8765:8765"
+    environment:
+      SOURCECRAFT_MCP_LOG: warn
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped

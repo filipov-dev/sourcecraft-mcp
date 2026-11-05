@@ -15,8 +15,11 @@ use rmcp::model::{JsonObject, Tool, ToolAnnotations};
 use serde_json::{Map, Value, json};
 use sourcecraft_api::spec::{OperationDef, ParamVariant, find, operations};
 
+use crate::dynamic_toolsets::ENABLE_TOOLSET_TOOL;
 use crate::error::ToolError;
-use crate::registry::{EXCLUDED_OPERATIONS, ToolRegistry, access_flag, access_name};
+use crate::registry::{
+    EXCLUDED_OPERATIONS, ToolRegistry, access_flag, access_name, takes_local_file,
+};
 use crate::toolsets::{available_toolsets, toolset_slug};
 
 /// Имя инструмента.
@@ -69,8 +72,8 @@ pub fn api_search_tool() -> Tool {
         the `id:` path form when the operation supports addressing by ID), access level, toolset, \
         required arguments, whether the tool is registered here and, if not, which server flag \
         enables it. Pass `tool_name` to get the full input schema of one operation.\n\n\
-        If the tool is registered, call it directly. If only its toolset is disabled, you can \
-        call the same path with `api_request`. If it needs a higher access level, ask the user to \
+        If the tool is registered, call it directly. If only its toolset is disabled, enable it \
+        with `enable_toolset` when the server offers that tool, or call the same path with `api_request`. If it needs a higher access level, ask the user to \
         restart the server with the named flag.\n\nAccess: read-only (does not call the API).";
     let mut tool = Tool::new(API_SEARCH_TOOL, description, Arc::new(schema));
     tool.title = Some("Search SourceCraft API operations".to_owned());
@@ -301,12 +304,38 @@ fn insert_availability(entry: &mut Map<String, Value>, op: &OperationDef, regist
         );
         return;
     }
+    if !registry.local_files() && takes_local_file(op) {
+        entry.insert(
+            "note".into(),
+            json!("Not available on this server: it uploads a local file, and this server runs on another machine (HTTP mode). Ask the user to upload the file in SourceCraft or to use a local (stdio) server."),
+        );
+        return;
+    }
     let mut flags = Vec::new();
     let access_ok = registry.max_access().allows(op.access);
     if !access_ok {
         flags.push(access_flag(op.access).to_owned());
     }
-    if !registry.toolset_enabled(op.tag) {
+    if registry.is_dynamic() {
+        // Набор агент включает сам; флаг нужен только для уровня доступа.
+        if access_ok {
+            entry.insert(
+                "enable_with".into(),
+                json!(format!(
+                    "{ENABLE_TOOLSET_TOOL} {{\"toolset\": \"{}\"}}",
+                    toolset_slug(op.tag)
+                )),
+            );
+            entry.insert(
+                "note".into(),
+                json!(format!(
+                    "Its toolset is not enabled: call `{ENABLE_TOOLSET_TOOL}` with this toolset, \
+                     or call the same method and path with `api_request`."
+                )),
+            );
+            return;
+        }
+    } else if !registry.toolset_enabled(op.tag) {
         flags.push(format!("--toolsets {}", toolset_slug(op.tag)));
     }
     entry.insert("enable_with".into(), json!(flags.join(" ")));
@@ -441,6 +470,32 @@ mod tests {
         );
 
         assert!(rank("zzzqqq", None).is_empty());
+    }
+
+    #[test]
+    fn dynamic_mode_suggests_enable_toolset() {
+        let dynamic = ToolRegistry::new(&ServerOptions {
+            max_access: AccessLevel::Read,
+            dynamic_toolsets: true,
+            ..ServerOptions::default()
+        })
+        .unwrap();
+        let result = run(json!({"tool_name": "get_issue"}), &dynamic).unwrap();
+        assert_eq!(result["registered"], false);
+        assert_eq!(
+            result["enable_with"],
+            r#"enable_toolset {"toolset": "issues"}"#
+        );
+        assert!(
+            result["note"]
+                .as_str()
+                .unwrap()
+                .contains("`enable_toolset`")
+        );
+
+        // Выше уровня доступа — только флаг сервера, без `--toolsets`.
+        let result = run(json!({"tool_name": "create_issue"}), &dynamic).unwrap();
+        assert_eq!(result["enable_with"], "--allow-write");
     }
 
     #[test]

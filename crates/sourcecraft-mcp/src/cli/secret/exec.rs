@@ -4,7 +4,7 @@
 //! stdin наследуется, stdout и stderr читаются параллельно и проходят через [`Masker`].
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::process::Stdio;
 
 use anyhow::{Context, bail};
@@ -143,7 +143,7 @@ pub fn prepare_env(
 
 #[cfg(unix)]
 fn env_value(_key: &str, value: &[u8]) -> anyhow::Result<OsString> {
-    use std::os::unix::ffi::OsStrExt;
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
     Ok(OsStr::from_bytes(value).to_os_string())
 }
 

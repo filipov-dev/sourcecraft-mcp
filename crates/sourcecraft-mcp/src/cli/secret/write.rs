@@ -58,6 +58,8 @@ pub fn write_secret_file(path: &Path, value: &[u8], mode: u32, force: bool) -> a
         file.set_permissions(std::fs::Permissions::from_mode(mode))
             .with_context(|| format!("cannot set the mode of `{}`", path.display()))?;
     }
+    // На Windows прав Unix нет: файл наследует ACL каталога (каталоги профиля пользователя
+    // по умолчанию закрыты от других пользователей). Это сказано в `--help` команды.
     #[cfg(not(unix))]
     let _ = mode;
     let written = file.write_all(value).and_then(|()| file.sync_all());

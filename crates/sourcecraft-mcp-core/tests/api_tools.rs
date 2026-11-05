@@ -23,7 +23,7 @@ async fn start(
 ) -> (RunningService<RoleClient, ()>, tokio::task::JoinHandle<()>) {
     let client = ApiClient::new(ClientConfig {
         base_url: api.uri().parse().unwrap(),
-        token: ApiToken::new(TEST_TOKEN),
+        token: Some(ApiToken::new(TEST_TOKEN)),
         timeout: Duration::from_secs(10),
         max_response_bytes: 64 * 1024,
     })

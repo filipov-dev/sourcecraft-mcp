@@ -494,15 +494,21 @@ mod tests {
             "{parts:?}"
         );
 
+        // Существующий файл вне корня: `/etc/hosts` в Windows не абсолютный путь.
+        let other = tempfile::tempdir().unwrap();
+        let outside = other.path().join("hosts");
+        std::fs::write(&outside, b"x").unwrap();
+        let outside = outside.display().to_string();
         let err = build_request(
             op("upload_issue_comment_attachment"),
-            &args(json!({"issue_comment_id": "1", "file": "/etc/hosts"})),
+            &args(json!({"issue_comment_id": "1", "file": outside})),
             &policy,
         )
         .unwrap_err();
         assert!(
-            err.message()
-                .contains("argument `file`: `/etc/hosts` is outside the allowed directories"),
+            err.message().contains(&format!(
+                "argument `file`: `{outside}` is outside the allowed directories"
+            )),
             "{err}"
         );
     }

@@ -2,10 +2,11 @@
 //!
 //! Команды, которая печатает значение токена, нет и быть не должно.
 
-use anyhow::{Context, bail};
 use clap::Subcommand;
+use sourcecraft_api::AccessLevel;
 use sourcecraft_api::auth::{AuthError, KEYRING_SERVICE, KeyringStore, TokenStore};
 
+use crate::browser::{BrowserDecision, BrowserEnv, decide};
 use crate::profiles::{ProfileRepo, ProfileSettings, validate_profile_name};
 use crate::ui::{TerminalUi, Ui};
 use crate::verify::{ApiVerifier, TokenVerifier};
@@ -30,6 +31,9 @@ pub enum AuthCommand {
         /// Store the token without checking it against the SourceCraft API.
         #[arg(long)]
         skip_check: bool,
+        /// Do not open the token creation page in a browser; only print its link.
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Remove the stored token of the profile from the system keychain.
     Logout {
@@ -51,9 +55,11 @@ pub async fn run(command: AuthCommand) -> anyhow::Result<()> {
         AuthCommand::Login {
             profile,
             skip_check,
+            no_browser,
         } => {
             let verifier = (!skip_check).then(ApiVerifier::new).transpose()?;
-            login(&store, &repo, verifier.as_ref(), &mut ui, &profile).await
+            let browser = decide(no_browser, &BrowserEnv::current());
+            login(&store, &repo, verifier.as_ref(), &mut ui, &profile, browser).await
         }
         AuthCommand::Logout { profile, forget } => logout(&store, &repo, &mut ui, &profile, forget),
     }
@@ -83,12 +89,23 @@ pub fn status(
                 "Client:   {}",
                 settings.client.as_deref().unwrap_or("-")
             ));
-            ui.say(&format!("Write:    {}", yes_no(settings.allow_write)));
-            ui.say(&format!("Delete:   {}", yes_no(settings.allow_destructive)));
-            let toolsets = if settings.toolsets.is_empty() {
-                "default".to_owned()
-            } else {
-                settings.toolsets.join(",")
+            // Действующий уровень, как у `serve`: удаление подразумевает запись.
+            let access = settings.access_level();
+            ui.say(&format!(
+                "Write:    {}",
+                yes_no(access.allows(AccessLevel::Write))
+            ));
+            ui.say(&format!(
+                "Delete:   {}",
+                yes_no(access == AccessLevel::Destructive)
+            ));
+            let toolsets = match (settings.dynamic_toolsets, settings.toolsets.is_empty()) {
+                (false, true) => "default".to_owned(),
+                (false, false) => settings.toolsets.join(","),
+                (true, true) => "on demand (none at start)".to_owned(),
+                (true, false) => {
+                    format!("on demand (at start: {})", settings.toolsets.join(","))
+                }
             };
             ui.say(&format!("Toolsets: {toolsets}"));
         }
@@ -104,17 +121,14 @@ pub async fn login<V: TokenVerifier>(
     verifier: Option<&V>,
     ui: &mut dyn Ui,
     profile: &str,
+    browser: BrowserDecision,
 ) -> anyhow::Result<()> {
     validate_profile_name(profile)?;
-    ui.say(&super::connect::token_instructions(profile, false));
-    let token = ui
-        .read_token(&format!(
-            "Paste the token for profile `{profile}` (input is hidden): "
-        ))
-        .context("failed to read the token")?;
-    if token.expose().is_empty() {
-        bail!("empty token; nothing was stored");
-    }
+    // Роли в подсказке — по уровню доступа уже сохранённого профиля.
+    let allow_write = repo
+        .get(profile)?
+        .is_some_and(|settings| settings.access_level() != AccessLevel::Read);
+    let token = super::connect::prompt_new_token(ui, profile, allow_write, browser)?;
     match verifier {
         Some(verifier) => {
             let user = verifier.verify(&token).await?;
@@ -178,6 +192,8 @@ mod tests {
     use crate::ui::testing::ScriptedUi;
     use crate::verify::testing::FakeVerifier;
 
+    const NO_BROWSER: BrowserDecision = BrowserDecision::Skip(crate::browser::SkipReason::Flag);
+
     fn verifier() -> FakeVerifier {
         FakeVerifier {
             valid_token: "good-token".into(),
@@ -195,7 +211,7 @@ mod tests {
         assert!(ui.text().contains("Token:    not found"));
 
         ui.tokens = ["good-token".to_owned()].into();
-        login(&store, &repo, Some(&verifier()), &mut ui, "ci")
+        login(&store, &repo, Some(&verifier()), &mut ui, "ci", NO_BROWSER)
             .await
             .unwrap();
         assert_eq!(store.get("ci").unwrap().expose(), "good-token");
@@ -236,12 +252,26 @@ mod tests {
             tokens: ["new".to_owned()].into(),
             ..Default::default()
         };
-        login::<FakeVerifier>(&store, &repo, None, &mut ui, "codex")
+        login::<FakeVerifier>(&store, &repo, None, &mut ui, "codex", NO_BROWSER)
             .await
             .unwrap();
         assert_eq!(store.get("codex").unwrap().expose(), "new");
         assert_eq!(repo.get("codex").unwrap(), Some(settings));
         assert!(ui.text().contains("Token replaced"));
+    }
+
+    #[test]
+    fn status_shows_effective_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = ProfileRepo::in_dir(dir.path());
+        let store = MemoryStore::new();
+        // Профиль старой версии: удаление без записи сохранено как есть.
+        std::fs::write(repo.path(), "[profiles.old]\nallow_destructive = true\n").unwrap();
+        let mut ui = ScriptedUi::default();
+        status(&store, &repo, &mut ui, "old").unwrap();
+        let text = ui.text();
+        assert!(text.contains("Write:    yes"), "{text}");
+        assert!(text.contains("Delete:   yes"), "{text}");
     }
 
     #[tokio::test]
@@ -254,7 +284,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            login(&store, &repo, Some(&verifier()), &mut ui, "ci")
+            login(&store, &repo, Some(&verifier()), &mut ui, "ci", NO_BROWSER)
                 .await
                 .is_err()
         );

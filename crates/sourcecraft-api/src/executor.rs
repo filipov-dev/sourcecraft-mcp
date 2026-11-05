@@ -5,6 +5,8 @@
 //! - путь проверяется [`validate_relative_path`] и приклеивается к `base_url`, поэтому
 //!   запрос не уходит на другой хост;
 //! - заголовок `Authorization` формируется только здесь и помечен как чувствительный;
+//!   токен задаётся при создании клиента (stdio: из системного хранилища) или для каждого
+//!   запроса через [`ApiClient::with_token`] (HTTP-режим: токен из запроса агента);
 //! - редиректы выполняются только в пределах того же origin;
 //! - размер тела ответа ограничен `max_response_bytes`, ошибки — [`ERROR_BODY_LIMIT`].
 
@@ -34,7 +36,10 @@ pub struct ClientConfig {
     /// Базовый адрес API. Может содержать префикс пути (`https://host/api/v1`), он сохраняется.
     /// Допустимы `https://` и `http://` только для loopback-адресов (локальные тесты).
     pub base_url: url::Url,
-    pub token: ApiToken,
+    /// Токен клиента. `None` — у клиента нет своего токена: запросы выполняются только через
+    /// копию с токеном ([`ApiClient::with_token`]), а [`ApiClient::execute`] без токена
+    /// возвращает ошибку и ничего не отправляет.
+    pub token: Option<ApiToken>,
     /// Таймаут всего запроса, включая чтение тела (и запись в `save_to`).
     pub timeout: std::time::Duration,
     /// Максимальный размер тела ответа, возвращаемого в MCP, в байтах. Больший ответ обрезается.
@@ -128,6 +133,9 @@ pub enum ApiError {
     /// Некорректная конфигурация клиента (`base_url`, токен).
     #[error("некорректная конфигурация клиента SourceCraft API: {0}")]
     InvalidConfig(String),
+    /// У клиента нет токена (см. [`ClientConfig::token`]); запрос не отправлялся.
+    #[error("нет токена SourceCraft для запроса")]
+    MissingToken,
     #[error("SourceCraft API вернул {status}: {body}")]
     Http { status: u16, body: String },
     #[error("ошибка соединения с SourceCraft API: {0}")]
@@ -142,7 +150,8 @@ pub struct ApiClient {
     config: ClientConfig,
     http: reqwest::Client,
     /// Готовый заголовок `Authorization: Bearer <token>`, помечен как sensitive.
-    auth: HeaderValue,
+    /// `None` — токена нет (см. [`ClientConfig::token`]).
+    auth: Option<HeaderValue>,
 }
 
 impl fmt::Debug for ApiClient {
@@ -157,12 +166,7 @@ impl fmt::Debug for ApiClient {
 impl ApiClient {
     pub fn new(config: ClientConfig) -> Result<Self, ApiError> {
         check_base_url(&config.base_url)?;
-
-        let mut auth = HeaderValue::from_str(&format!("Bearer {}", config.token.expose()))
-            .map_err(|_| {
-                ApiError::InvalidConfig("токен содержит недопустимые для заголовка символы".into())
-            })?;
-        auth.set_sensitive(true);
+        let auth = config.token.as_ref().map(auth_header).transpose()?;
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -201,8 +205,46 @@ impl ApiClient {
         &self.config
     }
 
+    /// Копия клиента с другим токеном: тот же `base_url`, таймауты и пул соединений.
+    ///
+    /// HTTP-режим сервера вызывает её на каждый вызов инструмента с токеном из заголовка
+    /// текущего HTTP-запроса агента: токен нигде не сохраняется и живёт, пока выполняется
+    /// запрос. Ограничения клиента (только `base_url`, редиректы в пределах origin) те же.
+    pub fn with_token(&self, token: ApiToken) -> Result<Self, ApiError> {
+        let auth = auth_header(&token)?;
+        let mut config = self.config.clone();
+        config.token = Some(token);
+        Ok(Self {
+            config,
+            http: self.http.clone(),
+            auth: Some(auth),
+        })
+    }
+
+    /// Заменяет токен клиента в тексте на `***`. Защита в глубину для текстов, которые
+    /// уходят агенту: токен не должен попасть в ответ, даже если API его отразил.
+    pub fn scrub_token(&self, text: String) -> String {
+        self.redact(text)
+    }
+
     /// Выполняет запрос. Не-2xx ответы возвращаются как [`ApiError::Http`].
     pub async fn execute(&self, request: ApiRequest) -> Result<ApiResponse, ApiError> {
+        self.execute_with_limit(request, self.config.max_response_bytes)
+            .await
+    }
+
+    /// Как [`Self::execute`], но тело ответа читается до `max_response_bytes` вместо лимита
+    /// из конфигурации.
+    ///
+    /// Нужен, когда ответ обрабатывается перед возвратом агенту (фильтр `jq` в ядре MCP):
+    /// обработке нужен ответ целиком, а лимит конфигурации вызывающий применяет уже к
+    /// результату обработки.
+    pub async fn execute_with_limit(
+        &self,
+        request: ApiRequest,
+        max_response_bytes: usize,
+    ) -> Result<ApiResponse, ApiError> {
+        let auth = self.auth.clone().ok_or(ApiError::MissingToken)?;
         let url = self.build_url(&request.path, &request.query)?;
         if let Some(save_to) = &request.save_to {
             check_save_to(save_to).await?;
@@ -213,7 +255,7 @@ impl ApiClient {
         let mut builder = self
             .http
             .request(to_method(request.method), url)
-            .header(header::AUTHORIZATION, self.auth.clone());
+            .header(header::AUTHORIZATION, auth);
         builder = attach_body(builder, request.body).await?;
 
         let response = builder
@@ -235,7 +277,7 @@ impl ApiClient {
                 },
                 truncated: false,
             }),
-            None => self.read_body(status, response).await,
+            None => self.read_body(status, response, max_response_bytes).await,
         }
     }
 
@@ -297,6 +339,7 @@ impl ApiClient {
         &self,
         status: StatusCode,
         mut response: reqwest::Response,
+        limit: usize,
     ) -> Result<ApiResponse, ApiError> {
         let status_code = status.as_u16();
         let content_type = response
@@ -320,7 +363,6 @@ impl ApiClient {
             });
         }
 
-        let limit = self.config.max_response_bytes;
         let (bytes, truncated) = read_limited(&mut response, limit).await?;
 
         if bytes.is_empty() {
@@ -373,12 +415,26 @@ impl ApiClient {
 
     /// Защита в глубину: если сервер вдруг отразил токен в тексте, вырезаем его.
     fn redact(&self, text: String) -> String {
-        let token = self.config.token.expose();
+        let Some(token) = self.config.token.as_ref().map(ApiToken::expose) else {
+            return text;
+        };
         if token.is_empty() || !text.contains(token) {
             return text;
         }
         text.replace(token, "***")
     }
+}
+
+/// Заголовок `Authorization: Bearer <token>`, помеченный как sensitive (не попадает в `Debug`).
+fn auth_header(token: &ApiToken) -> Result<HeaderValue, ApiError> {
+    if token.expose().trim().is_empty() {
+        return Err(ApiError::InvalidConfig("пустой токен".into()));
+    }
+    let mut auth = HeaderValue::from_str(&format!("Bearer {}", token.expose())).map_err(|_| {
+        ApiError::InvalidConfig("токен содержит недопустимые для заголовка символы".into())
+    })?;
+    auth.set_sensitive(true);
+    Ok(auth)
 }
 
 fn to_method(method: HttpMethod) -> Method {

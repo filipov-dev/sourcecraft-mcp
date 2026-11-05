@@ -9,7 +9,11 @@ rust-version.workspace = true
 
 [dependencies]
 base64 = "0.23.1"
-keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+# Secret Service в Linux — через zbus (чистый Rust, рантайм async-io, шифрование
+# сессии на Rust): бинарник не линкуется с libdbus и OpenSSL и собирается статически
+# (musl). async-io крутит D-Bus в своём потоке, поэтому синхронный API keyring
+# можно вызывать из кода внутри tokio-рантайма без взаимоблокировки.
+keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
 mime_guess = "2.0.5"
 percent-encoding = "2.3.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "multipart", "stream", "query", "http2"] }

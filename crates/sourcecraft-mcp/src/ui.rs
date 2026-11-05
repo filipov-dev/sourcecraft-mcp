@@ -13,6 +13,8 @@ pub trait Ui {
     fn read_token(&mut self, prompt: &str) -> io::Result<ApiToken>;
     /// Вопрос «да/нет». Ответ по умолчанию — «нет».
     fn confirm(&mut self, question: &str) -> io::Result<bool>;
+    /// Открывает ссылку в браузере по умолчанию, не дожидаясь его.
+    fn open_url(&mut self, url: &str) -> io::Result<()>;
 }
 
 /// Терминал: вывод в stdout, токен через `rpassword` (читает напрямую из TTY без эха).
@@ -40,6 +42,10 @@ impl Ui for TerminalUi {
             "y" | "yes"
         ))
     }
+
+    fn open_url(&mut self, url: &str) -> io::Result<()> {
+        crate::browser::open_in_browser(url)
+    }
 }
 
 #[cfg(test)]
@@ -55,6 +61,10 @@ pub mod testing {
         pub answers: VecDeque<bool>,
         pub output: Vec<String>,
         pub questions: Vec<String>,
+        /// Ссылки, которые сценарий «открыл» в браузере (настоящий браузер не запускается).
+        pub opened: Vec<String>,
+        /// Открытие браузера завершается ошибкой.
+        pub open_fails: bool,
     }
 
     impl ScriptedUi {
@@ -80,6 +90,14 @@ pub mod testing {
             self.answers
                 .pop_front()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no answer scripted"))
+        }
+
+        fn open_url(&mut self, url: &str) -> io::Result<()> {
+            if self.open_fails {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "no browser"));
+            }
+            self.opened.push(url.to_owned());
+            Ok(())
         }
     }
 }

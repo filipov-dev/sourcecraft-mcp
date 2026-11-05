@@ -39,7 +39,7 @@ impl TokenVerifier for ApiVerifier {
     async fn verify(&self, token: &ApiToken) -> anyhow::Result<String> {
         let client = ApiClient::new(ClientConfig {
             base_url: self.base_url.clone(),
-            token: token.clone(),
+            token: Some(token.clone()),
             timeout: Duration::from_secs(30),
             max_response_bytes: 1024 * 1024,
         })

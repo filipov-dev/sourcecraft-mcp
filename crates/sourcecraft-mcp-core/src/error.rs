@@ -53,8 +53,10 @@ pub fn describe_api_error(err: &ApiError) -> String {
                     " (the request was rejected: check the arguments against the tool schema)"
                 }
                 401 => {
-                    " (the token was rejected: it may be expired or revoked; the user can store a \
-                     new one with `sourcecraft-mcp auth login --profile <profile>`)"
+                    // Как заменить токен, зависит от режима сервера (хранилище или заголовок
+                    // HTTP-запроса), поэтому подробности — в инструкциях сервера.
+                    " (the token was rejected: it may be expired or revoked; ask the user to \
+                     replace it as described in the server instructions)"
                 }
                 403 => " (the token has no permission for this operation or resource)",
                 404 => {
@@ -79,6 +81,7 @@ pub fn describe_api_error(err: &ApiError) -> String {
             .to_owned(),
         ApiError::InvalidRequest(detail) => format!("invalid request: {detail}"),
         ApiError::InvalidConfig(detail) => format!("server configuration error: {detail}"),
+        ApiError::MissingToken => "no SourceCraft token was supplied for this request".to_owned(),
         ApiError::Transport(detail) => format!("could not reach the SourceCraft API: {detail}"),
         ApiError::Io(detail) => format!("local file error: {detail}"),
     }
@@ -102,7 +105,7 @@ mod tests {
             status: 401,
             body: " ".into(),
         });
-        assert!(text.contains("auth login"), "{text}");
+        assert!(text.contains("server instructions"), "{text}");
         assert!(!text.contains("Response body"), "{text}");
     }
 

@@ -17,7 +17,7 @@ const TOKEN: &str = "test-token-LEAKCHECK-7f3a9";
 fn config(base: &str) -> ClientConfig {
     ClientConfig {
         base_url: url::Url::parse(base).unwrap(),
-        token: ApiToken::new(TOKEN),
+        token: Some(ApiToken::new(TOKEN)),
         timeout: Duration::from_secs(5),
         max_response_bytes: 64 * 1024,
     }
@@ -342,6 +342,14 @@ async fn large_response_is_truncated() {
         ResponseBody::Text(text) => assert_eq!(text, "ж".repeat(500)),
         other => panic!("ожидался Text, получено {other:?}"),
     }
+
+    // Лимит отдельного запроса заменяет лимит конфигурации.
+    let response = client
+        .execute_with_limit(get("/big"), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(!response.truncated);
+    assert!(matches!(response.body, ResponseBody::Json(_)));
 }
 
 #[tokio::test]
@@ -535,6 +543,66 @@ async fn cross_origin_redirect_is_not_followed() {
 }
 
 #[tokio::test]
+async fn client_without_token_sends_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(path("/me"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let mut cfg = config(&server.uri());
+    cfg.token = None;
+    let client = ApiClient::new(cfg).unwrap();
+    let err = client.execute(get("/me")).await.unwrap_err();
+    assert!(matches!(err, ApiError::MissingToken), "{err:?}");
+}
+
+#[tokio::test]
+async fn with_token_uses_its_own_token_per_copy() {
+    let server = MockServer::start().await;
+    for token in ["token-agent-a", "token-agent-b"] {
+        Mock::given(path("/me"))
+            .and(header("authorization", format!("Bearer {token}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"token": token})))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(path("/echo"))
+        .respond_with(|req: &Request| {
+            let auth = req.headers.get("authorization").unwrap().to_str().unwrap();
+            ResponseTemplate::new(403).set_body_string(format!("denied: {auth}"))
+        })
+        .mount(&server)
+        .await;
+
+    let mut cfg = config(&server.uri());
+    cfg.token = None;
+    let base = ApiClient::new(cfg).unwrap();
+    let a = base.with_token(ApiToken::new("token-agent-a")).unwrap();
+    let b = base.with_token(ApiToken::new("token-agent-b")).unwrap();
+    a.execute(get("/me")).await.unwrap();
+    b.execute(get("/me")).await.unwrap();
+    // Исходный клиент токен не получил.
+    assert!(matches!(
+        base.execute(get("/me")).await.unwrap_err(),
+        ApiError::MissingToken
+    ));
+
+    // Токен копии вырезается из ошибок и из текстов через scrub_token.
+    let err = a.execute(get("/echo")).await.unwrap_err();
+    assert!(!format!("{err}").contains("token-agent-a"), "{err}");
+    assert_eq!(a.scrub_token("x token-agent-a y".into()), "x *** y");
+
+    // Недопустимые значения отклоняются без отражения в ошибке.
+    for bad in ["", "  ", "bad\ntoken"] {
+        let err = base.with_token(ApiToken::new(bad)).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidConfig(_)), "{err:?}");
+        assert!(!format!("{err:?}").contains("bad\ntoken"));
+    }
+}
+
+#[tokio::test]
 async fn token_never_leaks() {
     // Конфигурация и клиент в Debug не показывают токен.
     let cfg = config("https://api.example");
@@ -631,7 +699,7 @@ fn rejects_insecure_or_invalid_config() {
         assert!(matches!(err, ApiError::InvalidConfig(_)), "{base}: {err:?}");
     }
     let mut cfg = config("https://api.example");
-    cfg.token = ApiToken::new("bad\ntoken");
+    cfg.token = Some(ApiToken::new("bad\ntoken"));
     let err = ApiClient::new(cfg).unwrap_err();
     assert!(matches!(err, ApiError::InvalidConfig(_)));
     assert!(!format!("{err:?}").contains("bad\ntoken"));

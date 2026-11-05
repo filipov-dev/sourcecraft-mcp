@@ -20,7 +20,8 @@ use sourcecraft_api::executor::{ApiRequest, RequestBody, validate_relative_path}
 use sourcecraft_api::spec::{AccessLevel, HttpMethod, OperationDef};
 
 use crate::error::ToolError;
-use crate::files::FilePolicy;
+use crate::files::{FilePolicy, LOCAL_FILES_DISABLED};
+use crate::jq::add_jq_argument;
 use crate::redact::is_secret_path;
 use crate::registry::{access_flag, access_name};
 use crate::request::{UPDATE_REPOSITORY_TOOL, check_guards};
@@ -47,6 +48,8 @@ const ARGUMENTS: &[&str] = &[
 pub struct PreparedRequest {
     pub request: ApiRequest,
     pub operation: Option<&'static OperationDef>,
+    /// Уровень доступа, который нужен запросу.
+    pub access: AccessLevel,
 }
 
 /// Описание инструмента; аннотации соответствуют максимальному уровню доступа сервера.
@@ -102,10 +105,11 @@ pub fn api_request_tool(max_access: AccessLevel) -> Tool {
         "required": ["method", "path"],
         "additionalProperties": false
     });
-    let schema = match schema {
+    let mut schema = match schema {
         Value::Object(map) => map,
         _ => JsonObject::new(),
     };
+    add_jq_argument(&mut schema);
 
     let allowed = match max_access {
         AccessLevel::Read => {
@@ -145,6 +149,25 @@ pub fn api_request_tool(max_access: AccessLevel) -> Tool {
     tool
 }
 
+/// Аргументы с локальными файлами; без локальных файлов (HTTP-режим) их нет в схеме.
+const FILE_ARGUMENTS: &[&str] = &["body_file", "content_type", "save_to"];
+
+/// Убирает из схемы `api_request` аргументы с локальными файлами (HTTP-режим). Если их всё же
+/// передать, [`prepare`] отклонит путь политикой [`FilePolicy::disabled`].
+pub fn without_local_files(tool: &mut Tool) {
+    let mut schema = (*tool.input_schema).clone();
+    if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+        for name in FILE_ARGUMENTS {
+            properties.remove(*name);
+        }
+        properties.insert(
+            "body".to_owned(),
+            json!({"description": "JSON request body (any JSON value), sent as application/json."}),
+        );
+    }
+    tool.input_schema = Arc::new(schema);
+}
+
 /// Проверяет аргументы, уровень доступа и файлы и собирает запрос.
 pub fn prepare(
     args: &JsonObject,
@@ -153,6 +176,13 @@ pub fn prepare(
 ) -> Result<PreparedRequest, ToolError> {
     let present = |name: &str| args.get(name).is_some_and(|value| !value.is_null());
     reject_unknown(args)?;
+    if files.is_disabled()
+        && let Some(name) = FILE_ARGUMENTS.iter().find(|name| present(name))
+    {
+        return Err(ToolError::new(format!(
+            "argument `{name}`: {LOCAL_FILES_DISABLED}"
+        )));
+    }
 
     let method = parse_method(args.get("method"))?;
     let path = parse_path(args.get("path"))?;
@@ -231,6 +261,7 @@ pub fn prepare(
 
     Ok(PreparedRequest {
         operation: decision.operation(),
+        access: decision.required,
         request: ApiRequest {
             method,
             path,
@@ -739,8 +770,13 @@ mod tests {
         ));
         assert_eq!(prepared.request.save_to, Some(root.join("out.json")));
 
+        // Существующий файл вне корня: `/etc/hosts` в Windows не абсолютный путь.
+        let other = tempfile::tempdir().unwrap();
+        let outside = other.path().join("hosts");
+        std::fs::write(&outside, b"x").unwrap();
+        let outside = outside.display().to_string();
         let message = prepare(
-            &args(json!({"method": "POST", "path": "/x", "body_file": "/etc/hosts"})),
+            &args(json!({"method": "POST", "path": "/x", "body_file": outside})),
             AccessLevel::Write,
             &files,
         )
@@ -748,7 +784,7 @@ mod tests {
         assert!(
             message
                 .message()
-                .contains("argument `body_file`: `/etc/hosts` is outside"),
+                .contains(&format!("argument `body_file`: `{outside}` is outside")),
             "{message}"
         );
         let message = prepare(
@@ -784,5 +820,30 @@ mod tests {
         let description = read.description.unwrap_or_default();
         assert!(description.contains("api_search"));
         assert!(description.contains("Toolsets do not restrict"));
+    }
+
+    #[test]
+    fn file_arguments_are_rejected_without_local_files() {
+        let files = FilePolicy::disabled();
+        for (name, value) in [
+            ("body_file", json!("/etc/hosts")),
+            ("save_to", json!("relative.json")),
+            ("content_type", json!("text/plain")),
+        ] {
+            let mut request = args(json!({"method": "POST", "path": "/repos/acme/web/issues"}));
+            request.insert(name.to_owned(), value);
+            let err = prepare(&request, AccessLevel::Destructive, &files).unwrap_err();
+            assert!(err.message().contains("HTTP mode"), "{name}: {err}");
+        }
+        let request = args(json!({"method": "GET", "path": "/me"}));
+        assert!(prepare(&request, AccessLevel::Read, &files).is_ok());
+
+        let mut tool = api_request_tool(AccessLevel::Read);
+        without_local_files(&mut tool);
+        let schema = Value::Object((*tool.input_schema).clone()).to_string();
+        assert!(
+            !schema.contains("body_file") && !schema.contains("save_to"),
+            "{schema}"
+        );
     }
 }

@@ -4,10 +4,12 @@
 //! - [`executor`] — выполнение HTTP-запросов к API.
 //! - [`path`] — проверка и сборка относительных путей API.
 //! - [`auth`] — хранение токенов в системном хранилище (Keychain и аналоги).
+//! - [`keychain`] — произвольные записи системного хранилища (источник для копирования секретов).
 //! - [`token`] — обёртка токена, которая не попадает в логи и `Debug`.
 
 pub mod auth;
 pub mod executor;
+pub mod keychain;
 pub mod path;
 pub mod spec;
 pub mod token;
