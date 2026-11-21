@@ -183,7 +183,11 @@ async fn api_request_on_read_only_server() {
     )
     .await;
     assert_eq!(result.is_error, Some(true));
-    assert!(text(&result).contains("--allow-write"), "{}", text(&result));
+    assert!(
+        text(&result).contains("`write` access"),
+        "{}",
+        text(&result)
+    );
     // Полный URL отклоняется.
     let result = call(
         &client,
@@ -205,7 +209,10 @@ async fn api_request_on_read_only_server() {
     let found: Value = serde_json::from_str(&text(&result)).unwrap();
     assert_eq!(found["results"][0]["tool_name"], "create_pull_request");
     assert_eq!(found["results"][0]["registered"], false);
-    assert_eq!(found["results"][0]["enable_with"], "--allow-write");
+    assert_eq!(
+        found["results"][0]["enable_with"],
+        "`write` access for the server's profile (`sourcecraft-mcp ui`)"
+    );
 
     client.cancel().await.unwrap();
     server.await.unwrap();
@@ -245,7 +252,7 @@ async fn api_request_on_write_server() {
     assert_eq!(result.is_error, Some(false), "{}", text(&result));
     assert_eq!(text(&result), r#"{"id":"pr-1"}"#);
 
-    // Секрет сырым PUT не записывается, публичность репозитория требует --allow-destructive.
+    // Секрет сырым PUT не записывается, публичность репозитория требует уровня удаления.
     let result = call(
         &client,
         "api_request",
@@ -262,7 +269,7 @@ async fn api_request_on_write_server() {
     .await;
     assert_eq!(result.is_error, Some(true));
     assert!(
-        text(&result).contains("--allow-destructive"),
+        text(&result).contains("`destructive` access"),
         "{}",
         text(&result)
     );
@@ -275,7 +282,7 @@ async fn api_request_on_write_server() {
     .await;
     assert_eq!(result.is_error, Some(true));
     assert!(
-        text(&result).contains("--allow-destructive"),
+        text(&result).contains("`destructive` access"),
         "{}",
         text(&result)
     );

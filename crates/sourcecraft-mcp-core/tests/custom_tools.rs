@@ -115,7 +115,7 @@ async fn custom_tools_follow_access_level() {
     let result = call(&read, "drop_repo", json!({"org": "a", "repo": "b"})).await;
     assert_eq!(result.is_error, Some(true));
     assert!(
-        text(&result).contains("--allow-destructive"),
+        text(&result).contains("`destructive` access"),
         "{}",
         text(&result)
     );

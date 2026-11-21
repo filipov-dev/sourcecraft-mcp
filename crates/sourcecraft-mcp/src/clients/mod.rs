@@ -7,9 +7,12 @@ use std::path::Path;
 
 use anyhow::{Context, bail};
 use clap::ValueEnum;
-use sourcecraft_api::AccessLevel;
 
 use crate::profiles::ProfileSettings;
+
+/// Имя бинарника без расширения: по нему `mcp-kit` узнаёт свои регистрации в клиентах и
+/// называет сервис одобренных прав в Keychain (`sourcecraft-mcp.access`).
+pub const EXE_STEM: &str = "sourcecraft-mcp";
 
 /// Абсолютный путь к бинарнику для тестов. В Windows путь без буквы диска не абсолютный,
 /// поэтому `/usr/local/bin/...` там не годится.
@@ -68,7 +71,8 @@ impl Scope {
 }
 
 /// Команда запуска сервера, которую получает MCP-клиент. Токена в ней нет: `serve` берёт его
-/// из системного хранилища по профилю.
+/// из системного хранилища по профилю. Флагов доступа тоже нет: права — настройка профиля,
+/// флаги `serve` их только сужают.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerSpec {
     pub command: String,
@@ -79,27 +83,13 @@ impl ServerSpec {
     /// `exe` — абсолютный путь к бинарнику. Путь не канонизируется: при установке через
     /// Homebrew symlink в `bin/` переживает обновление версии, а путь в `Cellar` — нет.
     pub fn new(exe: &Path, profile: &str, settings: &ProfileSettings) -> anyhow::Result<Self> {
-        if !exe.is_absolute() {
-            bail!("executable path `{}` is not absolute", exe.display());
-        }
-        let command = exe
-            .to_str()
-            .with_context(|| format!("executable path `{}` is not valid UTF-8", exe.display()))?
-            .to_owned();
+        let command = command_string(exe)?;
 
         let mut args = vec![
             "serve".to_owned(),
             "--profile".to_owned(),
             profile.to_owned(),
         ];
-        // Флаги — по действующему уровню: удаление всегда передаётся вместе с записью.
-        let access = settings.access_level();
-        if access.allows(AccessLevel::Write) {
-            args.push("--allow-write".to_owned());
-        }
-        if access == AccessLevel::Destructive {
-            args.push("--allow-destructive".to_owned());
-        }
         if !settings.toolsets.is_empty() {
             args.push("--toolsets".to_owned());
             args.push(settings.toolsets.join(","));
@@ -113,12 +103,46 @@ impl ServerSpec {
         Ok(Self { command, args })
     }
 
+    /// Та же регистрация без флагов доступа (`--allow-write`, `--allow-destructive`,
+    /// `--allow-path`): остальные аргументы сохраняются как есть. Для повторной регистрации
+    /// из `ui`.
+    pub fn without_access_flags(command: &Path, args: &[String]) -> anyhow::Result<Self> {
+        let command = command_string(command)?;
+        let mut kept = Vec::with_capacity(args.len());
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--allow-write" | "--allow-destructive" => {}
+                "--allow-path" => {
+                    iter.next();
+                }
+                other if other.starts_with("--allow-path=") => {}
+                _ => kept.push(arg.clone()),
+            }
+        }
+        Ok(Self {
+            command,
+            args: kept,
+        })
+    }
+
     /// Команда целиком для показа пользователю.
     pub fn display(&self) -> String {
         shell_join(
             std::iter::once(self.command.as_str()).chain(self.args.iter().map(String::as_str)),
         )
     }
+}
+
+/// Абсолютный путь к бинарнику строкой (UTF-8).
+fn command_string(exe: &Path) -> anyhow::Result<String> {
+    if !exe.is_absolute() {
+        bail!("executable path `{}` is not absolute", exe.display());
+    }
+    Ok(exe
+        .to_str()
+        .with_context(|| format!("executable path `{}` is not valid UTF-8", exe.display()))?
+        .to_owned())
 }
 
 /// Склеивает аргументы в строку для показа, экранируя их как в POSIX shell.
@@ -159,19 +183,19 @@ mod tests {
             client: None,
             allow_write: true,
             allow_destructive: true,
+            allow_path: vec![PathBuf::from(TEST_EXE)],
             toolsets: vec!["repos".into(), "issues".into()],
             allow_secret_values: true,
             dynamic_toolsets: true,
         };
         let spec = ServerSpec::new(&exe, "ci", &settings).unwrap();
+        // Права профиля в регистрацию не попадают.
         assert_eq!(
             spec.args,
             [
                 "serve",
                 "--profile",
                 "ci",
-                "--allow-write",
-                "--allow-destructive",
                 "--toolsets",
                 "repos,issues",
                 "--allow-secret-values",
@@ -181,23 +205,37 @@ mod tests {
     }
 
     #[test]
-    fn server_spec_destructive_implies_write() {
+    fn access_flags_are_dropped_from_old_registrations() {
         let exe = PathBuf::from(TEST_EXE);
-        let settings = ProfileSettings {
-            allow_destructive: true,
-            ..ProfileSettings::default()
-        };
-        let spec = ServerSpec::new(&exe, "ci", &settings).unwrap();
+        let old: Vec<String> = [
+            "serve",
+            "--profile",
+            "ci",
+            "--allow-write",
+            "--allow-destructive",
+            "--allow-path",
+            "/srv/a",
+            "--allow-path=/srv/b",
+            "--toolsets",
+            "issues",
+            "--allow-secret-values",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let spec = ServerSpec::without_access_flags(&exe, &old).unwrap();
+        assert_eq!(spec.command, TEST_EXE);
         assert_eq!(
             spec.args,
             [
                 "serve",
                 "--profile",
                 "ci",
-                "--allow-write",
-                "--allow-destructive"
+                "--toolsets",
+                "issues",
+                "--allow-secret-values"
             ]
         );
+        assert!(ServerSpec::without_access_flags(Path::new("x"), &old).is_err());
     }
 
     #[test]

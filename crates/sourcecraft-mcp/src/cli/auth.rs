@@ -3,10 +3,13 @@
 //! Команды, которая печатает значение токена, нет и быть не должно.
 
 use clap::Subcommand;
+use mcp_kit::approval::{self, ApprovalStore};
 use sourcecraft_api::AccessLevel;
 use sourcecraft_api::auth::{AuthError, KEYRING_SERVICE, KeyringStore, TokenStore};
 
 use crate::browser::{BrowserDecision, BrowserEnv, decide};
+use crate::cli::serve::approval_text;
+use crate::clients::EXE_STEM;
 use crate::profiles::{ProfileRepo, ProfileSettings, validate_profile_name};
 use crate::ui::{TerminalUi, Ui};
 use crate::verify::{ApiVerifier, TokenVerifier};
@@ -51,7 +54,10 @@ pub async fn run(command: AuthCommand) -> anyhow::Result<()> {
     let repo = ProfileRepo::open_default()?;
     let mut ui = TerminalUi;
     match command {
-        AuthCommand::Status { profile } => status(&store, &repo, &mut ui, &profile),
+        AuthCommand::Status { profile } => {
+            let approvals = approval::platform_store(EXE_STEM);
+            status(&store, &repo, approvals.as_deref(), &mut ui, &profile)
+        }
         AuthCommand::Login {
             profile,
             skip_check,
@@ -69,9 +75,11 @@ fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
+/// Состояние профиля: токен (без значения), настройки, права и их одобрение на macOS.
 pub fn status(
     store: &dyn TokenStore,
     repo: &ProfileRepo,
+    approvals: Option<&dyn ApprovalStore>,
     ui: &mut dyn Ui,
     profile: &str,
 ) -> anyhow::Result<()> {
@@ -99,6 +107,16 @@ pub fn status(
                 "Delete:   {}",
                 yes_no(access == AccessLevel::Destructive)
             ));
+            for path in &settings.allow_path {
+                ui.say(&format!("Path:     {}", path.display()));
+            }
+            // Действующие права: на macOS — только одобренные владельцем.
+            let verified = approval::verify(approvals, profile, &settings.access())
+                .map_err(|err| anyhow::anyhow!("profile `{profile}`: {err}"))?;
+            ui.say(&format!("Approval: {}", approval_text(&verified.state)));
+            if let Some(warning) = verified.warning(EXE_STEM, profile) {
+                ui.say(&format!("Warning:  {warning}"));
+            }
             let toolsets = match (settings.dynamic_toolsets, settings.toolsets.is_empty()) {
                 (false, true) => "default".to_owned(),
                 (false, false) => settings.toolsets.join(","),
@@ -112,6 +130,9 @@ pub fn status(
         None => ui.say("Settings: none (read-only defaults)"),
     }
     ui.say(&format!("Profiles: {}", repo.path().display()));
+    ui.say(&format!(
+        "Change the access with `{EXE_STEM} ui` (profile `{profile}`)."
+    ));
     Ok(())
 }
 
@@ -207,7 +228,7 @@ mod tests {
         let store = MemoryStore::new();
         let mut ui = ScriptedUi::default();
 
-        status(&store, &repo, &mut ui, "ci").unwrap();
+        status(&store, &repo, None, &mut ui, "ci").unwrap();
         assert!(ui.text().contains("Token:    not found"));
 
         ui.tokens = ["good-token".to_owned()].into();
@@ -218,7 +239,7 @@ mod tests {
         assert_eq!(repo.get("ci").unwrap(), Some(ProfileSettings::default()));
 
         let mut ui = ScriptedUi::default();
-        status(&store, &repo, &mut ui, "ci").unwrap();
+        status(&store, &repo, None, &mut ui, "ci").unwrap();
         let text = ui.text();
         assert!(text.contains("Token:    stored"), "{text}");
         assert!(text.contains("Write:    no"), "{text}");
@@ -268,10 +289,54 @@ mod tests {
         // Профиль старой версии: удаление без записи сохранено как есть.
         std::fs::write(repo.path(), "[profiles.old]\nallow_destructive = true\n").unwrap();
         let mut ui = ScriptedUi::default();
-        status(&store, &repo, &mut ui, "old").unwrap();
+        status(&store, &repo, None, &mut ui, "old").unwrap();
         let text = ui.text();
         assert!(text.contains("Write:    yes"), "{text}");
         assert!(text.contains("Delete:   yes"), "{text}");
+        assert!(
+            text.contains("Approval: not used on this platform"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn status_shows_the_approval_on_macos() {
+        use mcp_kit::approval::testing::MemoryStore as MemoryApprovals;
+        use mcp_kit::{AccessLevel as Level, ProfileAccess};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = ProfileRepo::in_dir(dir.path());
+        let store = MemoryStore::new();
+        repo.upsert(
+            "ci",
+            ProfileSettings {
+                allow_destructive: true,
+                ..ProfileSettings::default()
+            },
+        )
+        .unwrap();
+        let approvals = MemoryApprovals::default();
+        let mut ui = ScriptedUi::default();
+        status(&store, &repo, Some(&approvals), &mut ui, "ci").unwrap();
+        let text = ui.text();
+        assert!(
+            text.contains("Approval: not approved on this Mac"),
+            "{text}"
+        );
+        assert!(text.contains("running read-only"), "{text}");
+        assert!(text.contains("sourcecraft-mcp ui"), "{text}");
+
+        approvals
+            .save("ci", &ProfileAccess::new(Level::Write, vec![]))
+            .unwrap();
+        let mut ui = ScriptedUi::default();
+        status(&store, &repo, Some(&approvals), &mut ui, "ci").unwrap();
+        let text = ui.text();
+        assert!(
+            text.contains("Approval: only `write` is approved on this Mac"),
+            "{text}"
+        );
+        assert!(text.contains("Warning:  profile `ci`"), "{text}");
     }
 
     #[tokio::test]

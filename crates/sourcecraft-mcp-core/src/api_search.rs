@@ -18,7 +18,7 @@ use sourcecraft_api::spec::{OperationDef, ParamVariant, find, operations};
 use crate::dynamic_toolsets::ENABLE_TOOLSET_TOOL;
 use crate::error::ToolError;
 use crate::registry::{
-    EXCLUDED_OPERATIONS, ToolRegistry, access_flag, access_name, takes_local_file,
+    EXCLUDED_OPERATIONS, ToolRegistry, access_enable_with, access_name, takes_local_file,
 };
 use crate::toolsets::{available_toolsets, toolset_slug};
 
@@ -70,11 +70,12 @@ pub fn api_search_tool() -> Tool {
     let description = "Search all SourceCraft API operations, including those whose tools are \
         not enabled on this server. Each result shows the tool name, HTTP method and path (also \
         the `id:` path form when the operation supports addressing by ID), access level, toolset, \
-        required arguments, whether the tool is registered here and, if not, which server flag \
-        enables it. Pass `tool_name` to get the full input schema of one operation.\n\n\
+        required arguments, whether the tool is registered here and, if not, what enables it \
+        (`enable_with`). Pass `tool_name` to get the full input schema of one operation.\n\n\
         If the tool is registered, call it directly. If only its toolset is disabled, enable it \
-        with `enable_toolset` when the server offers that tool, or call the same path with `api_request`. If it needs a higher access level, ask the user to \
-        restart the server with the named flag.\n\nAccess: read-only (does not call the API).";
+        with `enable_toolset` when the server offers that tool, or call the same path with `api_request`. If it needs a higher access level, ask the user for \
+        what `enable_with` names; only the user can change the access.\n\nAccess: read-only \
+        (does not call the API).";
     let mut tool = Tool::new(API_SEARCH_TOOL, description, Arc::new(schema));
     tool.title = Some("Search SourceCraft API operations".to_owned());
     tool.annotations = Some(ToolAnnotations::new().read_only(true));
@@ -311,10 +312,11 @@ fn insert_availability(entry: &mut Map<String, Value>, op: &OperationDef, regist
         );
         return;
     }
+    let local = registry.local_files();
     let mut flags = Vec::new();
     let access_ok = registry.max_access().allows(op.access);
     if !access_ok {
-        flags.push(access_flag(op.access).to_owned());
+        flags.push(access_enable_with(op.access, local));
     }
     if registry.is_dynamic() {
         // Набор агент включает сам; флаг нужен только для уровня доступа.
@@ -338,10 +340,18 @@ fn insert_availability(entry: &mut Map<String, Value>, op: &OperationDef, regist
     } else if !registry.toolset_enabled(op.tag) {
         flags.push(format!("--toolsets {}", toolset_slug(op.tag)));
     }
-    entry.insert("enable_with".into(), json!(flags.join(" ")));
+    // У локального сервера уровень — настройка профиля, а не флаг: части через `; `.
+    entry.insert(
+        "enable_with".into(),
+        json!(flags.join(if local { "; " } else { " " })),
+    );
     let note = if access_ok {
         "Its toolset is not enabled: call the same method and path with `api_request`, or ask \
          the user to add the toolset."
+    } else if local {
+        "Needs a higher access level than this server allows: ask the user to allow the access \
+         in `enable_with` for the server's profile (`sourcecraft-mcp ui`) and restart the MCP \
+         client, if the change is intended."
     } else {
         "Needs a higher access level than this server allows: ask the user to restart the server \
          with the flag in `enable_with` if the change is intended."
@@ -495,7 +505,10 @@ mod tests {
 
         // Выше уровня доступа — только флаг сервера, без `--toolsets`.
         let result = run(json!({"tool_name": "create_issue"}), &dynamic).unwrap();
-        assert_eq!(result["enable_with"], "--allow-write");
+        assert_eq!(
+            result["enable_with"],
+            "`write` access for the server's profile (`sourcecraft-mcp ui`)"
+        );
     }
 
     #[test]
@@ -510,7 +523,10 @@ mod tests {
         assert_eq!(first["access"], "write");
         assert_eq!(first["toolset"], "repository-pullrequest");
         assert_eq!(first["registered"], false);
-        assert_eq!(first["enable_with"], "--allow-write");
+        assert_eq!(
+            first["enable_with"],
+            "`write` access for the server's profile (`sourcecraft-mcp ui`)"
+        );
         assert_eq!(
             first["required_params"],
             json!(["org_slug", "repo_slug", "body"])
@@ -598,7 +614,10 @@ mod tests {
         assert_eq!(result["tool_name"], "update_repository");
         assert_eq!(result["method"], "PATCH");
         assert_eq!(result["registered"], false);
-        assert_eq!(result["enable_with"], "--allow-write");
+        assert_eq!(
+            result["enable_with"],
+            "`write` access for the server's profile (`sourcecraft-mcp ui`)"
+        );
         assert_eq!(result["input_schema"]["type"], "object");
         assert!(result["input_schema"]["properties"]["body"].is_object());
 

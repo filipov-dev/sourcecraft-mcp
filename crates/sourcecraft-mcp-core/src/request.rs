@@ -92,20 +92,24 @@ pub fn build_request(
 ///
 /// `update_repository` с `visibility: public` открывает репозиторий всему интернету, поэтому
 /// требует уровень `Destructive`, хотя сама операция — `Write`.
+/// `local_machine` — сервер на машине агента (stdio): от этого зависит подсказка, как
+/// включить уровень (см. [`crate::registry::access_hint`]).
 pub fn check_guards(
     op: &OperationDef,
     args: &JsonObject,
     max_access: AccessLevel,
+    local_machine: bool,
 ) -> Result<(), ToolError> {
     if op.tool_name == UPDATE_REPOSITORY_TOOL
         && sets_public_visibility(args.get("body"))
         && !max_access.allows(AccessLevel::Destructive)
     {
-        return Err(ToolError::new(
-            "making a repository public is treated as a destructive change and requires the \
-             server to run with --allow-destructive; ask the user to make the repository public \
-             in SourceCraft or to restart the server with that flag",
-        ));
+        return Err(ToolError::new(format!(
+            "making a repository public is treated as a destructive change and requires \
+             `destructive` access; ask the user to make the repository public in SourceCraft or \
+             to {}",
+            crate::registry::access_hint(AccessLevel::Destructive, local_machine)
+        )));
     }
     Ok(())
 }
@@ -521,13 +525,16 @@ mod tests {
         let private = args(json!({"repo_id": "1", "body": {"visibility": "private"}}));
         let other = args(json!({"repo_id": "1", "body": {"description": "d"}}));
 
-        let err = check_guards(update, &public, AccessLevel::Write).unwrap_err();
-        assert!(err.message().contains("--allow-destructive"), "{err}");
-        assert!(check_guards(update, &public_text, AccessLevel::Write).is_err());
-        assert!(check_guards(update, &public, AccessLevel::Destructive).is_ok());
-        assert!(check_guards(update, &private, AccessLevel::Write).is_ok());
-        assert!(check_guards(update, &other, AccessLevel::Write).is_ok());
+        let err = check_guards(update, &public, AccessLevel::Write, true).unwrap_err();
+        assert!(err.message().contains("`destructive` access"), "{err}");
+        assert!(err.message().contains("sourcecraft-mcp ui"), "{err}");
+        let remote = check_guards(update, &public, AccessLevel::Write, false).unwrap_err();
+        assert!(remote.message().contains("--allow-destructive"), "{remote}");
+        assert!(check_guards(update, &public_text, AccessLevel::Write, true).is_err());
+        assert!(check_guards(update, &public, AccessLevel::Destructive, true).is_ok());
+        assert!(check_guards(update, &private, AccessLevel::Write, true).is_ok());
+        assert!(check_guards(update, &other, AccessLevel::Write, true).is_ok());
         // Остальные операции проверка не затрагивает.
-        assert!(check_guards(op("create_repository"), &public, AccessLevel::Write).is_ok());
+        assert!(check_guards(op("create_repository"), &public, AccessLevel::Write, true).is_ok());
     }
 }

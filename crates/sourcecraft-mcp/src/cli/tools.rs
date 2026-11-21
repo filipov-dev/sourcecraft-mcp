@@ -13,7 +13,7 @@ use sourcecraft_api::AccessLevel;
 use sourcecraft_mcp_core::custom_tools::check_names;
 use sourcecraft_mcp_core::{CustomTool, CustomToolsFile};
 
-use crate::profiles::config_dir;
+use crate::profiles::{ProfileRepo, config_dir};
 
 /// Имя файла пользовательских инструментов в каталоге конфигурации.
 pub const TOOLS_FILE: &str = "tools.toml";
@@ -49,10 +49,23 @@ pub fn default_tools_file() -> Option<PathBuf> {
     config_dir().ok().map(|dir| dir.join(TOOLS_FILE))
 }
 
+/// Файл пользователя рядом с файлом профилей `repo` (в тестах — во временном каталоге).
+pub fn user_tools_file(repo: &ProfileRepo) -> PathBuf {
+    repo.path()
+        .parent()
+        .map(|dir| dir.join(TOOLS_FILE))
+        .unwrap_or_else(|| PathBuf::from(TOOLS_FILE))
+}
+
 /// Загружает инструменты из файла пользователя (если он есть) и из `extra` (обязательны).
 pub fn load(extra: &[PathBuf]) -> anyhow::Result<Vec<CustomTool>> {
-    let default = default_tools_file().filter(|path| path.exists());
-    load_files(default.as_deref(), extra)
+    load_with(default_tools_file().as_deref(), extra)
+}
+
+/// То же, что [`load`], с явным путём файла пользователя: файла может и не быть.
+pub fn load_with(default: Option<&Path>, extra: &[PathBuf]) -> anyhow::Result<Vec<CustomTool>> {
+    let default = default.filter(|path| path.exists());
+    load_files(default, extra)
 }
 
 fn load_files(default: Option<&Path>, extra: &[PathBuf]) -> anyhow::Result<Vec<CustomTool>> {
@@ -118,7 +131,7 @@ fn render(tools: &[CustomTool]) -> String {
         ));
     }
     out.push_str(
-        "\nTools above the server's access level (--allow-write, --allow-destructive) are not \
+        "\nTools above the access of the server's profile (`sourcecraft-mcp ui`) are not \
          registered.\n",
     );
     out

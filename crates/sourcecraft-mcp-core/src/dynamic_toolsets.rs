@@ -22,7 +22,7 @@ use serde_json::{Map, Value, json};
 use sourcecraft_api::spec::{AccessLevel, find, operations};
 
 use crate::error::ToolError;
-use crate::registry::{EXCLUDED_OPERATIONS, ToolKind, ToolRegistry, access_flag};
+use crate::registry::{EXCLUDED_OPERATIONS, ToolKind, ToolRegistry, access_hint};
 use crate::secret_copy::SECRET_COPY_TOOL;
 use crate::secrets::{SECRET_SET_TOOL, SET_SECRET_OPERATION};
 use crate::toolsets::{available_toolsets, normalize_toolsets, toolset_slug};
@@ -186,13 +186,14 @@ pub fn list(args: &JsonObject, registry: &ToolRegistry) -> Result<String, ToolEr
          `api_request` are always available."
     );
     if hidden_total > 0 {
-        let flag = match registry.max_access() {
-            AccessLevel::Read => access_flag(AccessLevel::Write),
-            _ => access_flag(AccessLevel::Destructive),
+        let level = match registry.max_access() {
+            AccessLevel::Read => AccessLevel::Write,
+            _ => AccessLevel::Destructive,
         };
+        let hint = access_hint(level, registry.local_files());
         note.push_str(&format!(
             " `above_access_level` counts operations this server does not allow at its access \
-             level; only the user can allow them by restarting the server (e.g. with {flag})."
+             level; only the user can allow them: ask the user to {hint}."
         ));
     }
     out.insert("note".into(), json!(note));
@@ -303,7 +304,8 @@ pub fn toggle(
     let note = if enable && !changed_sets.is_empty() && diff.is_empty() {
         Some(
             "No tools were added: all operations of this toolset are above the server's access \
-             level. Only the user can allow them by restarting the server."
+             level. Only the user can allow them, in the access of the server's profile \
+             (`sourcecraft-mcp ui`)."
                 .to_owned(),
         )
     } else if enable && !diff.is_empty() {
@@ -379,7 +381,7 @@ mod tests {
         assert_eq!(secrets["enabled"], false);
         // `delete_secret` и `set_secret` выше уровня чтения.
         assert!(secrets["above_access_level"].as_u64().unwrap() >= 1);
-        assert!(out["note"].as_str().unwrap().contains("--allow-write"));
+        assert!(out["note"].as_str().unwrap().contains("`write` access"));
 
         let err = list(&args(json!({"x": 1})), &reg).unwrap_err();
         assert!(err.message().contains("no arguments"));
@@ -501,7 +503,7 @@ mod tests {
         assert!(
             read.unavailable_reason(SECRET_COPY_TOOL)
                 .unwrap()
-                .contains("--allow-write")
+                .contains("`write` access")
         );
     }
 
@@ -527,6 +529,6 @@ mod tests {
         assert!(reason.contains("`enable_toolset`"), "{reason}");
         assert!(reason.contains("toolset: \"issues\""), "{reason}");
         let reason = reg.unavailable_reason("create_issue").unwrap();
-        assert!(reason.contains("--allow-write"), "{reason}");
+        assert!(reason.contains("`write` access"), "{reason}");
     }
 }

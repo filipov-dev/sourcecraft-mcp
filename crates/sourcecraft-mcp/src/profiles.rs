@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use mcp_kit::ProfileAccess;
 use serde::{Deserialize, Serialize};
 use sourcecraft_api::auth::{AuthError, KeyringStore, TokenStore};
 use sourcecraft_api::{AccessLevel, ApiToken};
@@ -18,6 +19,12 @@ pub const CONFIG_DIR_ENV: &str = "SOURCECRAFT_MCP_CONFIG_DIR";
 
 /// Имя файла профилей в каталоге конфигурации.
 pub const PROFILES_FILE: &str = "profiles.toml";
+
+/// Профиль по умолчанию для `serve` (stdio), `call` и `auth`.
+pub const DEFAULT_PROFILE: &str = "default";
+
+/// Переменная окружения с профилем для `call` и `secret` (`serve` её не читает).
+pub const PROFILE_ENV: &str = "SOURCECRAFT_MCP_PROFILE";
 
 /// Максимальная длина имени профиля.
 const MAX_PROFILE_LEN: usize = 64;
@@ -29,10 +36,14 @@ pub struct ProfileSettings {
     /// MCP-клиент, в котором зарегистрирован профиль (`claude-code`, `codex`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client: Option<String>,
-    /// Разрешены операции записи (`serve --allow-write`).
+    /// Разрешены операции записи. Флаг `serve --allow-write` права только сужает.
     pub allow_write: bool,
-    /// Разрешены удаляющие операции (`serve --allow-destructive`).
+    /// Разрешены удаляющие операции. Флаг `serve --allow-destructive` права только сужает.
     pub allow_destructive: bool,
+    /// Дополнительные каталоги для локальных файлов инструментов (`serve --allow-path`
+    /// только сужает их). Абсолютные пути. Не записывается, если пусто.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allow_path: Vec<PathBuf>,
     /// Включённые наборы инструментов (`serve --toolsets`); пустой список — набор по умолчанию.
     pub toolsets: Vec<String>,
     /// Разрешено раскрывать значения секретов по явному запросу (`serve --allow-secret-values`).
@@ -50,6 +61,21 @@ impl ProfileSettings {
     /// `allow_write = false` дают уровень `Destructive`.
     pub fn access_level(&self) -> AccessLevel {
         access_level(self.allow_write, self.allow_destructive)
+    }
+
+    /// Права профиля: уровень доступа и каталоги. Флаги `serve` их только сужают, на macOS
+    /// они ещё и сверяются с одобренными (см. [`mcp_kit::approval`]).
+    pub fn access(&self) -> ProfileAccess {
+        ProfileAccess::new(
+            mcp_kit::AccessLevel::from_flags(self.allow_write, self.allow_destructive),
+            self.allow_path.clone(),
+        )
+    }
+
+    /// Записывает права в настройки.
+    pub fn set_access(&mut self, access: &ProfileAccess) {
+        (self.allow_write, self.allow_destructive) = access.level.to_flags();
+        self.allow_path = access.allow_path.clone();
     }
 
     /// Приводит флаги доступа к действующему уровню: `allow_destructive` включает `allow_write`.
@@ -131,6 +157,11 @@ impl ProfileRepo {
         Ok(self.load()?.profiles.remove(name))
     }
 
+    /// Все профили файла по имени.
+    pub fn list(&self) -> anyhow::Result<BTreeMap<String, ProfileSettings>> {
+        Ok(self.load()?.profiles)
+    }
+
     /// Создаёт или заменяет профиль. Флаги доступа сохраняются нормализованными
     /// (см. [`ProfileSettings::normalized`]).
     pub fn upsert(&self, name: &str, settings: ProfileSettings) -> anyhow::Result<()> {
@@ -195,14 +226,19 @@ pub fn load_profile(name: &str) -> anyhow::Result<(ProfileSettings, ApiToken)> {
 /// То же, что [`load_profile`], но отсутствие токена превращается в понятную пользователю
 /// ошибку с подсказкой, как его сохранить (для `serve` и `secret`).
 pub fn load_profile_explained(name: &str) -> anyhow::Result<(ProfileSettings, ApiToken)> {
-    load_profile(name).map_err(|err| match err.downcast_ref::<AuthError>() {
+    load_profile(name).map_err(|err| explain_load_error(err, name))
+}
+
+/// Ошибка загрузки профиля для пользователя: без токена — подсказка, как его сохранить.
+pub fn explain_load_error(err: anyhow::Error, name: &str) -> anyhow::Error {
+    match err.downcast_ref::<AuthError>() {
         Some(AuthError::NotFound { .. }) => anyhow::anyhow!(
             "no SourceCraft token is stored for profile `{name}`. Store one with \
              `sourcecraft-mcp auth login --profile {name}` or register a client with \
              `sourcecraft-mcp connect <client> --profile {name}`"
         ),
         _ => err.context(format!("cannot load profile `{name}`")),
-    })
+    }
 }
 
 /// То же, что [`load_profile`], с явными файлом профилей и хранилищем токенов.
@@ -227,10 +263,39 @@ mod tests {
             client: Some("codex".into()),
             allow_write: true,
             allow_destructive: false,
+            allow_path: vec![],
             toolsets: vec!["repos".into(), "issues".into()],
             allow_secret_values: true,
             dynamic_toolsets: true,
         }
+    }
+
+    #[test]
+    fn access_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = ProfileRepo::in_dir(dir.path());
+        let mut settings = sample();
+        assert_eq!(settings.access().level, mcp_kit::AccessLevel::Write);
+        let root = dir.path().join("files");
+        settings.set_access(&ProfileAccess::new(
+            mcp_kit::AccessLevel::Destructive,
+            vec![root.clone()],
+        ));
+        assert!(settings.allow_write && settings.allow_destructive);
+        repo.upsert("work", settings.clone()).unwrap();
+        let text = fs::read_to_string(repo.path()).unwrap();
+        assert!(text.contains("allow_path = ["), "{text}");
+        let loaded = repo.get("work").unwrap().unwrap();
+        assert_eq!(loaded.access().allow_path, vec![root]);
+        assert_eq!(loaded, settings);
+        settings.set_access(&ProfileAccess::read_only());
+        assert!(!settings.allow_write && !settings.allow_destructive);
+        assert!(settings.allow_path.is_empty());
+        assert_eq!(repo.list().unwrap().len(), 1);
+        // Без каталогов поле не записывается: файл читается и прежними версиями.
+        repo.upsert("plain", sample()).unwrap();
+        let text = fs::read_to_string(repo.path()).unwrap();
+        assert_eq!(text.matches("allow_path").count(), 1, "{text}");
     }
 
     #[test]

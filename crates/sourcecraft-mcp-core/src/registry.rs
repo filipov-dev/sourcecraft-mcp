@@ -320,10 +320,10 @@ impl ToolRegistry {
         if let Some(&access) = self.disabled_custom.get(name) {
             return Some(format!(
                 "custom tool `{name}` is disabled: it {} data in SourceCraft and the server runs \
-                 with {} access. Ask the user to restart the server with {} if this is intended",
+                 with {} access. Ask the user to {} if this is intended",
                 access_verb(access),
                 access_name(self.max_access),
-                access_flag(access),
+                access_hint(access, self.local_files),
             ));
         }
         if name == SECRET_SET_TOOL {
@@ -334,8 +334,8 @@ impl ToolRegistry {
             if !self.max_access.allows(AccessLevel::Write) {
                 return Some(format!(
                     "tool `{name}` is disabled: it writes secrets in SourceCraft and the server \
-                     runs with read-only access. Ask the user to restart the server with \
-                     --allow-write if this change is intended"
+                     runs with read-only access. Ask the user to {} if this change is intended",
+                    access_hint(AccessLevel::Write, self.local_files)
                 ));
             }
             return self.toolset_reason(name, op.tag);
@@ -362,15 +362,12 @@ impl ToolRegistry {
             ));
         }
         if !self.max_access.allows(op.access) {
-            let flag = match op.access {
-                AccessLevel::Destructive => "--allow-destructive",
-                _ => "--allow-write",
-            };
             return Some(format!(
                 "tool `{name}` is disabled: it {} data in SourceCraft and the server runs with {} \
-                 access. Ask the user to restart the server with {flag} if this change is intended",
+                 access. Ask the user to {} if this change is intended",
                 access_verb(op.access),
                 access_name(self.max_access),
+                access_hint(op.access, self.local_files),
             ));
         }
         self.toolset_reason(name, op.tag)
@@ -474,12 +471,40 @@ pub fn access_name(access: AccessLevel) -> &'static str {
     }
 }
 
-/// Флаг сервера, который включает уровень доступа `access`.
+/// Флаг HTTP-сервера, который включает уровень доступа `access`.
 pub fn access_flag(access: AccessLevel) -> &'static str {
     match access {
         AccessLevel::Read => "no extra flag",
         AccessLevel::Write => "--allow-write",
         AccessLevel::Destructive => "--allow-destructive",
+    }
+}
+
+/// Что пользователь делает, чтобы включить уровень `access`; фраза продолжает «Ask the user
+/// to …». Локальный сервер (`local_machine`, stdio): права — настройка профиля, флаги
+/// регистрации их не расширяют, а на macOS повышение ещё и одобряется Touch ID. HTTP-сервер:
+/// уровень задают флаги запуска.
+pub fn access_hint(access: AccessLevel, local_machine: bool) -> String {
+    match (access, local_machine) {
+        (AccessLevel::Read, _) => "keep the read-only access".to_owned(),
+        (level, true) => format!(
+            "allow `{}` access for the server's profile with `sourcecraft-mcp ui` and restart \
+             the MCP client",
+            access_name(level)
+        ),
+        (level, false) => format!("restart the server with {}", access_flag(level)),
+    }
+}
+
+/// Короткая форма [`access_hint`] для поля `enable_with` в `api_search`.
+pub fn access_enable_with(access: AccessLevel, local_machine: bool) -> String {
+    if local_machine {
+        format!(
+            "`{}` access for the server's profile (`sourcecraft-mcp ui`)",
+            access_name(access)
+        )
+    } else {
+        access_flag(access).to_owned()
     }
 }
 
@@ -628,7 +653,7 @@ mod tests {
         let write = ToolRegistry::new(&options(AccessLevel::Write, None)).unwrap();
         assert!(write.get("secret_set").is_none());
         let reason = write.unavailable_reason("secret_set").unwrap();
-        assert!(reason.contains("--allow-destructive"), "{reason}");
+        assert!(reason.contains("`destructive` access"), "{reason}");
 
         let secrets =
             ToolRegistry::new(&options(AccessLevel::Destructive, Some(&["secrets"]))).unwrap();
@@ -645,7 +670,7 @@ mod tests {
         let read = ToolRegistry::new(&options(AccessLevel::Read, None)).unwrap();
         assert!(read.get("secret_copy").is_none());
         let reason = read.unavailable_reason("secret_copy").unwrap();
-        assert!(reason.contains("--allow-write"), "{reason}");
+        assert!(reason.contains("`write` access"), "{reason}");
 
         let write = ToolRegistry::new(&options(AccessLevel::Write, None)).unwrap();
         let tool = write.get("secret_copy").unwrap();
@@ -690,10 +715,26 @@ mod tests {
     fn unavailable_reasons_name_the_flag() {
         let read = ToolRegistry::new(&options(AccessLevel::Read, None)).unwrap();
         let reason = read.unavailable_reason("create_pull_request").unwrap();
-        assert!(reason.contains("--allow-write"), "{reason}");
+        assert!(reason.contains("`write` access"), "{reason}");
+        assert!(reason.contains("sourcecraft-mcp ui"), "{reason}");
         let reason = read.unavailable_reason("delete_repository").unwrap();
-        assert!(reason.contains("--allow-destructive"), "{reason}");
+        assert!(reason.contains("`destructive` access"), "{reason}");
         assert!(read.unavailable_reason("get_repository").is_none());
+
+        // HTTP-сервер: уровень задают флаги запуска, а не профиль.
+        let remote = ToolRegistry::new(&ServerOptions {
+            local_machine: false,
+            ..options(AccessLevel::Read, None)
+        })
+        .unwrap();
+        let reason = remote.unavailable_reason("create_pull_request").unwrap();
+        assert!(
+            reason.contains("restart the server with --allow-write"),
+            "{reason}"
+        );
+        assert!(!reason.contains("sourcecraft-mcp ui"), "{reason}");
+        let reason = remote.unavailable_reason("delete_repository").unwrap();
+        assert!(reason.contains("--allow-destructive"), "{reason}");
         assert!(read.unavailable_reason("no_such_tool").is_none());
 
         let issues = ToolRegistry::new(&options(AccessLevel::Read, Some(&["issues"]))).unwrap();

@@ -151,7 +151,7 @@ async fn read_only_server_end_to_end() {
         .await
         .unwrap();
     assert_eq!(result.is_error, Some(true));
-    assert!(text(&result).contains("--allow-write"));
+    assert!(text(&result).contains("`write` access"));
 
     // Ошибка аргументов не доходит до API.
     let result = client
@@ -201,7 +201,7 @@ async fn write_server_lists_write_tools_and_guards_visibility() {
         .await
         .unwrap();
     assert_eq!(result.is_error, Some(true));
-    assert!(text(&result).contains("--allow-destructive"));
+    assert!(text(&result).contains("`destructive` access"));
     // Запрос в API не отправлялся.
     assert!(api.received_requests().await.unwrap().is_empty());
 

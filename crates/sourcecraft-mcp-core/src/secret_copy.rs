@@ -18,7 +18,7 @@
 //!   работает, только если сервер передал доступ к хранилищу ([`CopyPolicy::keychain`],
 //!   флаг `serve --allow-keychain-source`); назначением `keychain://` агент быть не может
 //!   (запись в хранилище машины). CLI запускает человек: там разрешено и то и другое. Записи
-//!   с токенами этого сервера недоступны всегда ([`KeychainItem::is_token_entry`]).
+//!   этого сервера (токены и одобренные права) недоступны всегда ([`KeychainItem::is_server_entry`]).
 
 use std::fmt;
 use std::sync::Arc;
@@ -209,9 +209,10 @@ fn keychain<'a>(
     policy: &'a CopyPolicy,
     item: &KeychainItem,
 ) -> Result<&'a dyn Keychain, ToolError> {
-    if item.is_token_entry() {
+    if item.is_server_entry() {
         return Err(ToolError::new(format!(
-            "`{item}` holds a sourcecraft-mcp API token; it cannot be copied or overwritten"
+            "`{item}` holds a sourcecraft-mcp API token or approved access; it cannot be copied \
+             or overwritten"
         )));
     }
     policy
@@ -396,8 +397,8 @@ pub fn secret_copy_tool(max_access: AccessLevel, keychain: KeychainMode) -> Tool
         "If the destination secret exists, it is overwritten (the old value cannot be restored): \
          confirm with the user first."
     } else {
-        "Only new destination keys can be created: overwriting an existing secret needs the \
-         server to run with --allow-destructive."
+        "Only new destination keys can be created: overwriting an existing secret needs \
+         `destructive` access."
     };
     let keychain = match keychain {
         KeychainMode::Allowed => {
@@ -544,7 +545,10 @@ mod tests {
         let annotations = write.annotations.unwrap();
         assert_eq!(annotations.destructive_hint, Some(false));
         let description = write.description.unwrap();
-        assert!(description.contains("--allow-destructive"), "{description}");
+        assert!(
+            description.contains("`destructive` access"),
+            "{description}"
+        );
         assert!(description.contains("disabled"), "{description}");
 
         let all = secret_copy_tool(AccessLevel::Destructive, KeychainMode::Allowed);

@@ -1,4 +1,4 @@
-//! Взаимодействие с пользователем в интерактивных командах (`connect`, `auth`).
+//! Взаимодействие с пользователем в интерактивных командах (`connect`, `auth`, `ui`).
 //!
 //! Вынесено в трейт, чтобы сценарии можно было тестировать без терминала.
 
@@ -45,6 +45,31 @@ impl Ui for TerminalUi {
 
     fn open_url(&mut self, url: &str) -> io::Result<()> {
         crate::browser::open_in_browser(url)
+    }
+}
+
+/// Вывод в память без вопросов, ввода и браузера: для действий из TUI (`ui`), где терминал
+/// занят интерфейсом. Ввод токена — ошибка, «да/нет» — отказ.
+#[derive(Debug, Default)]
+pub struct CaptureUi {
+    pub lines: Vec<String>,
+}
+
+impl Ui for CaptureUi {
+    fn say(&mut self, line: &str) {
+        self.lines.push(line.to_owned());
+    }
+
+    fn read_token(&mut self, _prompt: &str) -> io::Result<ApiToken> {
+        Err(io::Error::other("token input is not available here"))
+    }
+
+    fn confirm(&mut self, _question: &str) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    fn open_url(&mut self, _url: &str) -> io::Result<()> {
+        Ok(())
     }
 }
 

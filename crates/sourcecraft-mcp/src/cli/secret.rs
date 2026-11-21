@@ -32,11 +32,9 @@ use sourcecraft_api::executor::{ApiClient, ClientConfig};
 use sourcecraft_api::keychain::SystemKeychain;
 
 use crate::base_url::{BASE_URL_ENV, resolve_base_url};
+pub use crate::profiles::PROFILE_ENV;
 use crate::profiles::load_profile_explained;
 use fetch::{RepoTarget, Secrets, fetch_secrets, repo_target};
-
-/// Переменная окружения с профилем по умолчанию для команд `secret` (имя профиля, не токен).
-pub const PROFILE_ENV: &str = "SOURCECRAFT_MCP_PROFILE";
 
 /// Таймаут запроса к API.
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -97,7 +95,8 @@ References:
 
 The value is read and written by sourcecraft-mcp and never printed; only the references and \
 the result (created or overwritten) are shown. An existing destination is replaced only with \
---force. Items that hold sourcecraft-mcp tokens cannot be copied or overwritten. Writing a \
+--force. Items that hold sourcecraft-mcp tokens or approved access cannot be copied or \
+overwritten. Writing a \
 repository secret is asynchronous: the command waits up to a minute for it to finish.
 
 Examples:

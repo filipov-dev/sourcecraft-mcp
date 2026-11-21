@@ -23,7 +23,7 @@ use crate::error::ToolError;
 use crate::files::{FilePolicy, LOCAL_FILES_DISABLED};
 use crate::jq::add_jq_argument;
 use crate::redact::is_secret_path;
-use crate::registry::{access_flag, access_name};
+use crate::registry::{access_hint, access_name};
 use crate::request::{UPDATE_REPOSITORY_TOOL, check_guards};
 use crate::routes::{AccessDecision, required_access};
 
@@ -118,7 +118,7 @@ pub fn api_request_tool(max_access: AccessLevel) -> Tool {
         }
         AccessLevel::Write => {
             "This server allows reading and changing data; deleting (and other destructive \
-             operations) needs --allow-destructive."
+             operations) needs `destructive` access."
         }
         AccessLevel::Destructive => {
             "This server allows reading, changing and deleting data; confirm destructive \
@@ -188,7 +188,9 @@ pub fn prepare(
     let path = parse_path(args.get("path"))?;
 
     let decision = required_access(method, &path);
-    check_access(method, &path, &decision, max_access)?;
+    // Политика файлов выключена только у удалённого (HTTP) сервера.
+    let local_machine = !files.is_disabled();
+    check_access(method, &path, &decision, max_access, local_machine)?;
     check_secret_files(&path, &present)?;
 
     if present("body") && present("body_file") {
@@ -215,7 +217,7 @@ pub fn prepare(
         .map(|m| m.op)
         .find(|op| op.tool_name == UPDATE_REPOSITORY_TOOL)
     {
-        check_guards(op, args, max_access)?;
+        check_guards(op, args, max_access, local_machine)?;
         if present("body_file") && !max_access.allows(AccessLevel::Destructive) {
             return Err(ToolError::new(
                 "this request updates repository settings; pass the changes as a JSON `body` \
@@ -285,7 +287,7 @@ fn check_secret_files(path: &str, present: &impl Fn(&str) -> bool) -> Result<(),
                 "`{arg}` cannot be used with secrets endpoints: secret values are hidden from \
                  the agent, and a file would bypass that. Call `api_request` without `{arg}` to \
                  see the keys; to see values, use `list_secrets` with `reveal_values: true` (only \
-                 if the user started the server with --allow-secret-values), or ask the user to \
+                 if the user allowed secret values for the server), or ask the user to \
                  look them up in SourceCraft or with the `sourcecraft-mcp` CLI. To set a secret, \
                  use `secret_set` (it reads the value from a local file with `value_file`)"
             )));
@@ -300,6 +302,7 @@ fn check_access(
     path: &str,
     decision: &AccessDecision,
     max_access: AccessLevel,
+    local_machine: bool,
 ) -> Result<(), ToolError> {
     if decision.matches_tool(SET_SECRET_OPERATION) {
         return Err(ToolError::new(
@@ -321,11 +324,11 @@ fn check_access(
     };
     Err(ToolError::new(format!(
         "{} {path} needs {} access ({reason}), but the server runs with {} access. Ask the user \
-         to restart the server with {} if this change is intended",
+         to {} if this change is intended",
         method.as_str(),
         access_name(decision.required),
         access_name(max_access),
-        access_flag(decision.required),
+        access_hint(decision.required, local_machine),
     )))
 }
 
@@ -614,7 +617,7 @@ mod tests {
         );
         assert!(message.contains("needs write access"), "{message}");
         assert!(message.contains("`create_pull_request`"), "{message}");
-        assert!(message.contains("--allow-write"), "{message}");
+        assert!(message.contains("`write` access"), "{message}");
 
         let message = err(
             json!({"method": "DELETE", "path": "/some/thing"}),
@@ -622,14 +625,14 @@ mod tests {
         );
         assert!(message.contains("needs destructive access"), "{message}");
         assert!(message.contains("match no known operation"), "{message}");
-        assert!(message.contains("--allow-destructive"), "{message}");
+        assert!(message.contains("`destructive` access"), "{message}");
 
         // Отказ по доступу раньше проверки файлов: путь вне корней не раскрывается.
         let message = err(
             json!({"method": "POST", "path": "/x", "body_file": "/etc/hosts"}),
             AccessLevel::Read,
         );
-        assert!(message.contains("--allow-write"), "{message}");
+        assert!(message.contains("`write` access"), "{message}");
 
         // POST, который только читает, доступен на сервере только для чтения.
         let prepared = prep(
@@ -721,7 +724,10 @@ mod tests {
                 json!({"method": "PATCH", "path": path, "body": {"visibility": "public"}}),
                 AccessLevel::Write,
             );
-            assert!(message.contains("--allow-destructive"), "{path}: {message}");
+            assert!(
+                message.contains("`destructive` access"),
+                "{path}: {message}"
+            );
         }
         assert!(
             prep(

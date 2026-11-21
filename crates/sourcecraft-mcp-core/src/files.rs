@@ -8,7 +8,8 @@
 //! - рабочий каталог процесса сервера (stdio-клиенты запускают сервер в каталоге проекта),
 //!   если это не корень файловой системы и не домашний каталог — они слишком широкие;
 //! - системный временный каталог;
-//! - каталоги из `--allow-path`.
+//! - дополнительные каталоги профиля (`allow_path`, флаг `serve --allow-path` их только
+//!   сужает).
 //!
 //! Корни и пути канонизируются (`canonicalize`), поэтому выход через `..` и символические
 //! ссылки обнаруживается: проверяется реальный путь, а не то, как он записан.
@@ -52,7 +53,8 @@ pub const LOCAL_FILES_DISABLED: &str = "local files are not available: this serv
 impl FilePolicy {
     /// Политика с корнями по умолчанию (рабочий каталог и временный каталог) и `extra`.
     ///
-    /// Каталоги из `extra` должны существовать: опечатка в `--allow-path` — ошибка запуска.
+    /// Каталоги из `extra` должны существовать: опечатка в каталоге профиля или в
+    /// `--allow-path` — ошибка запуска.
     /// Недоступные корни по умолчанию пропускаются с предупреждением в лог.
     pub fn with_defaults(extra: &[PathBuf]) -> Result<Self, FilePolicyError> {
         let cwd = std::env::current_dir().ok();
@@ -211,8 +213,8 @@ impl FilePolicy {
             return Ok(());
         }
         Err(FilePolicyError(format!(
-            "`{original}` is outside the allowed directories ({}); the user can allow more with \
-             `--allow-path <dir>`",
+            "`{original}` is outside the allowed directories ({}); the user can allow more \
+             directories for the server's profile with `sourcecraft-mcp ui`",
             self.describe_roots()
         )))
     }

@@ -194,7 +194,7 @@ async fn overwrite_requires_destructive_access() {
     assert_eq!(result.is_error, Some(true));
     let message = text(&result);
     assert!(message.contains("already exists"), "{message}");
-    assert!(message.contains("--allow-destructive"), "{message}");
+    assert!(message.contains("`destructive` access"), "{message}");
     assert!(!message.contains(VALUE), "{message}");
 }
 
@@ -392,7 +392,7 @@ async fn registration_follows_access_level() {
     assert!(read.registry().get("secret_copy").is_none());
     let result = copy(&read, "sc://a/b/K", "sc://c/d/K").await;
     assert_eq!(result.is_error, Some(true));
-    assert!(text(&result).contains("--allow-write"));
+    assert!(text(&result).contains("`write` access"));
     assert!(api.received_requests().await.unwrap().is_empty());
 
     let write = server(&api, AccessLevel::Write, None);

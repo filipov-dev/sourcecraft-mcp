@@ -1,9 +1,11 @@
 //! Произвольные записи системного хранилища (Keychain и аналоги) — для копирования секретов
 //! (`keychain://<service>/<account>`).
 //!
-//! Записи с токенами этого сервера (сервис [`KEYRING_SERVICE`]) недоступны ни на чтение, ни на
-//! запись: иначе через копирование секрета токен агента можно было бы вынести в репозиторий,
-//! а запись — подменить чужой токен. Проверка — и здесь, и в вызывающем коде.
+//! Записи этого сервера недоступны ни на чтение, ни на запись: токены (сервис
+//! [`KEYRING_SERVICE`]) — иначе через копирование секрета токен агента можно было бы вынести в
+//! репозиторий, а запись — подменить чужой токен; одобренные права (сервис
+//! [`APPROVAL_SERVICE`], macOS) — иначе запись в него одобрила бы права без Touch ID.
+//! Проверка — и здесь, и в вызывающем коде.
 //!
 //! Значения не попадают в `Debug`, ошибки и логи.
 
@@ -12,6 +14,11 @@ use std::fmt;
 use std::sync::Mutex;
 
 use crate::auth::KEYRING_SERVICE;
+
+/// Сервис записей с правами, одобренными владельцем на macOS (крейт `mcp-kit`: сервис
+/// `<бинарник>.access`, учётная запись — имя профиля). Совпадение с `mcp-kit` проверяет тест
+/// бинарника.
+pub const APPROVAL_SERVICE: &str = "sourcecraft-mcp.access";
 
 /// Запись системного хранилища: сервис и учётная запись.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -28,10 +35,13 @@ impl KeychainItem {
         }
     }
 
-    /// Запись относится к хранилищу токенов этого сервера. Сравнение без учёта регистра и
-    /// пробелов по краям: на некоторых платформах имена сервисов регистронезависимы.
-    pub fn is_token_entry(&self) -> bool {
-        self.service.trim().eq_ignore_ascii_case(KEYRING_SERVICE)
+    /// Запись принадлежит этому серверу: токен профиля или одобренные права. Сравнение без
+    /// учёта регистра и пробелов по краям: на некоторых платформах имена сервисов
+    /// регистронезависимы.
+    pub fn is_server_entry(&self) -> bool {
+        let service = self.service.trim();
+        service.eq_ignore_ascii_case(KEYRING_SERVICE)
+            || service.eq_ignore_ascii_case(APPROVAL_SERVICE)
     }
 }
 
@@ -63,8 +73,10 @@ impl fmt::Debug for SecretValue {
 
 #[derive(Debug, thiserror::Error)]
 pub enum KeychainError {
-    #[error("keychain item `{0}` holds a sourcecraft-mcp token and cannot be read or written here")]
-    TokenEntry(KeychainItem),
+    #[error(
+        "keychain item `{0}` belongs to sourcecraft-mcp (a token or approved access) and cannot be read or written here"
+    )]
+    ServerEntry(KeychainItem),
     #[error("system keychain error for `{item}`: {message}")]
     Backend { item: KeychainItem, message: String },
 }
@@ -78,8 +90,8 @@ pub trait Keychain: Send + Sync + fmt::Debug {
 }
 
 fn guard(item: &KeychainItem) -> Result<(), KeychainError> {
-    if item.is_token_entry() {
-        return Err(KeychainError::TokenEntry(item.clone()));
+    if item.is_server_entry() {
+        return Err(KeychainError::ServerEntry(item.clone()));
     }
     Ok(())
 }
@@ -167,20 +179,25 @@ mod tests {
     #[test]
     fn token_entries_are_refused() {
         let keychain = MemoryKeychain::new();
-        for service in [KEYRING_SERVICE, " DEV.Filipov.SourceCraft-MCP "] {
+        for service in [
+            KEYRING_SERVICE,
+            " DEV.Filipov.SourceCraft-MCP ",
+            APPROVAL_SERVICE,
+            "SourceCraft-MCP.Access",
+        ] {
             let item = KeychainItem::new(service, "codex");
-            assert!(item.is_token_entry());
+            assert!(item.is_server_entry());
             assert!(matches!(
                 keychain.get(&item),
-                Err(KeychainError::TokenEntry(_))
+                Err(KeychainError::ServerEntry(_))
             ));
             assert!(matches!(
                 keychain.set(&item, b"x"),
-                Err(KeychainError::TokenEntry(_))
+                Err(KeychainError::ServerEntry(_))
             ));
             assert!(matches!(
                 SystemKeychain.get(&item),
-                Err(KeychainError::TokenEntry(_))
+                Err(KeychainError::ServerEntry(_))
             ));
         }
     }

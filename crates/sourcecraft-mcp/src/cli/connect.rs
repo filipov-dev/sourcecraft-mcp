@@ -1,21 +1,24 @@
 //! `sourcecraft-mcp connect` — подключение сервера к MCP-клиенту.
 //!
 //! Сценарий: инструкция по созданию токена и форма создания в браузере → скрытый ввод →
-//! проверка `GET /user` → токен в системное хранилище, настройки в `profiles.toml` →
-//! регистрация сервера в клиенте после подтверждения. Токен не попадает ни в аргументы, ни в
-//! конфигурацию клиента.
+//! проверка `GET /user` → токен в системное хранилище, настройки в `profiles.toml` (права —
+//! только если заданы флаги; на macOS повышение прав одобряется Touch ID или паролем) →
+//! регистрация сервера в клиенте после подтверждения, без флагов доступа. Токен не попадает
+//! ни в аргументы, ни в конфигурацию клиента.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use clap::Args;
+use mcp_kit::approval::{self, ApprovalStore, Presence};
+use mcp_kit::{AccessLevel, ProfileAccess};
+use sourcecraft_api::ApiToken;
 use sourcecraft_api::auth::{KEYRING_SERVICE, KeyringStore, TokenStore};
-use sourcecraft_api::{AccessLevel, ApiToken};
 use sourcecraft_mcp_core::normalize_toolsets;
 
 use crate::browser::{BrowserDecision, BrowserEnv, SkipReason, TOKEN_FORM_URL, decide};
 use crate::clients::claude::{self, CommandRunner, SystemRunner};
-use crate::clients::{ClientKind, Scope, ServerSpec, codex};
+use crate::clients::{ClientKind, EXE_STEM, Scope, ServerSpec, codex};
 use crate::profiles::{ProfileRepo, ProfileSettings, validate_profile_name};
 use crate::ui::{TerminalUi, Ui};
 use crate::verify::{ApiVerifier, TokenVerifier};
@@ -27,7 +30,13 @@ pub const PAT_DOCS_URL: &str = "https://sourcecraft.dev/portal/docs/en/sourcecra
 #[command(after_help = "\
 The token is read with hidden input and stored only in the system keychain \
 (macOS Keychain, Windows Credential Manager or Secret Service on Linux) under the profile name. \
-The client config gets only the command `sourcecraft-mcp serve --profile <profile> ...`.
+The client config gets only the command `sourcecraft-mcp serve --profile <profile> ...`, \
+without access flags.
+
+The access is a setting of the profile: --allow-write and --allow-destructive change it \
+(without them the profile keeps its access, read-only for a new profile), and \
+`sourcecraft-mcp ui` changes it later. On macOS, raising the access asks for Touch ID or the \
+macOS password; access that is not approved does not take effect.
 
 When a new token is needed, the token creation page opens in the default browser; over SSH, \
 without a graphical session or with --no-browser only its link is printed.
@@ -43,10 +52,12 @@ pub struct ConnectArgs {
     /// Where to register the server in the client. Codex supports only `user`.
     #[arg(long, value_enum, default_value_t = Scope::User)]
     pub scope: Scope,
-    /// Allow tools that create or modify data in SourceCraft.
+    /// Set the access of the profile to write: tools that create or modify data in
+    /// SourceCraft.
     #[arg(long)]
     pub allow_write: bool,
-    /// Allow tools that delete data in SourceCraft.
+    /// Set the access of the profile to destructive: also tools that delete data in
+    /// SourceCraft (implies --allow-write).
     #[arg(long)]
     pub allow_destructive: bool,
     /// Comma-separated toolsets to enable (see `sourcecraft-mcp toolsets`). Default: all.
@@ -76,7 +87,10 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         ClientKind::Codex => codex::default_codex_home()?,
         ClientKind::ClaudeCode => PathBuf::new(),
     };
+    let approvals = approval::platform_store(EXE_STEM);
+    let presence = approval::platform_presence();
     let mut env = ConnectEnv {
+        approval: approvals.as_deref().zip(presence.as_deref()),
         store: &KeyringStore,
         repo: &ProfileRepo::open_default()?,
         verifier: &ApiVerifier::new()?,
@@ -91,6 +105,8 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
 
 /// Зависимости `connect`; в тестах подменяются хранилищем в памяти и временными каталогами.
 pub struct ConnectEnv<'a, V> {
+    /// Одобрение прав (macOS); `None` — платформа без одобрения.
+    pub approval: Option<(&'a dyn ApprovalStore, &'a dyn Presence)>,
     pub store: &'a dyn TokenStore,
     pub repo: &'a ProfileRepo,
     pub verifier: &'a V,
@@ -171,22 +187,27 @@ pub async fn connect<V: TokenVerifier>(
         .unwrap_or_else(|| client.name().to_owned());
     validate_profile_name(&profile)?;
     let toolsets = normalize_toolsets(&args.toolsets).map_err(|err| anyhow::anyhow!(err))?;
-    let settings = ProfileSettings {
-        client: Some(client.name().to_owned()),
-        allow_write: args.allow_write,
-        allow_destructive: args.allow_destructive,
-        toolsets,
-        allow_secret_values: args.allow_secret_values,
-        dynamic_toolsets: args.dynamic_toolsets,
-    }
-    .normalized();
-    let spec = ServerSpec::new(&env.exe, &profile, &settings)?;
+    let requested_level = AccessLevel::requested_by_flags(args.allow_write, args.allow_destructive);
+    // Регистрация не зависит от прав профиля: флагов доступа в ней нет.
+    let spec = ServerSpec::new(
+        &env.exe,
+        &profile,
+        &ProfileSettings {
+            toolsets: toolsets.clone(),
+            allow_secret_values: args.allow_secret_values,
+            dynamic_toolsets: args.dynamic_toolsets,
+            ..ProfileSettings::default()
+        },
+    )?;
 
     // Проверки клиента — до ввода токена, чтобы не просить токен зря.
     match client {
         ClientKind::ClaudeCode => claude::ensure_available(env.runner)?,
         ClientKind::Codex => codex::ensure_scope(args.scope)?,
     }
+    let mut settings = env.repo.get(&profile)?.unwrap_or_default();
+    // Роли в подсказке о токене — по уровню, который будет у профиля.
+    let level = requested_level.unwrap_or(settings.access().level);
 
     let stored = env.store.contains(&profile)?;
     let token = if stored {
@@ -196,12 +217,7 @@ pub async fn connect<V: TokenVerifier>(
         ));
         env.store.get(&profile)?
     } else {
-        prompt_new_token(
-            env.ui,
-            &profile,
-            settings.access_level() != AccessLevel::Read,
-            env.browser,
-        )?
+        prompt_new_token(env.ui, &profile, level != AccessLevel::Read, env.browser)?
     };
 
     if args.skip_check {
@@ -218,6 +234,13 @@ pub async fn connect<V: TokenVerifier>(
         env.ui.say(&format!(
             "Token saved in the system keychain (service `{KEYRING_SERVICE}`, account `{profile}`)."
         ));
+    }
+    settings.client = Some(client.name().to_owned());
+    settings.toolsets = toolsets;
+    settings.allow_secret_values = args.allow_secret_values;
+    settings.dynamic_toolsets = args.dynamic_toolsets;
+    if let Some(level) = requested_level {
+        change_access(env.ui, env.approval, &profile, &mut settings, level);
     }
     env.repo.upsert(&profile, settings)?;
     env.ui.say(&format!(
@@ -248,10 +271,40 @@ pub async fn connect<V: TokenVerifier>(
     Ok(())
 }
 
+/// Меняет уровень доступа профиля (каталоги профиля остаются). На macOS повышение сначала
+/// одобряется владельцем; отказ не останавливает `connect`: профиль сохраняет прежние права.
+fn change_access(
+    ui: &mut dyn Ui,
+    approval: Option<(&dyn ApprovalStore, &dyn Presence)>,
+    profile: &str,
+    settings: &mut ProfileSettings,
+    level: AccessLevel,
+) {
+    let before = settings.access();
+    let access = ProfileAccess::new(level, before.allow_path.clone());
+    let what = format!("{EXE_STEM} profile \"{profile}\"");
+    match approval::save_access_with(approval, profile, &what, &access, |access| {
+        settings.set_access(access);
+        Ok(())
+    }) {
+        Ok(saved) if saved.prompted => ui.say(&format!(
+            "Access `{}` approved on this Mac.",
+            saved.access.summary()
+        )),
+        Ok(_) => {}
+        Err(err) => ui.say(&format!(
+            "The access was not changed: {err}. The profile keeps `{}` access; change it later \
+             with `{EXE_STEM} ui` (profile `{profile}`).",
+            before.summary()
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
+    use mcp_kit::approval::testing::{FakePresence, MemoryStore as MemoryApprovals};
     use sourcecraft_api::ApiToken;
     use sourcecraft_api::auth::MemoryStore;
 
@@ -269,6 +322,8 @@ mod tests {
         ui: ScriptedUi,
         codex_home: PathBuf,
         browser: BrowserDecision,
+        /// Одобрение прав, как на macOS; `None` — как на Linux и Windows.
+        approval: Option<(MemoryApprovals, FakePresence)>,
     }
 
     impl Fixture {
@@ -284,12 +339,18 @@ mod tests {
                 ui: ScriptedUi::default(),
                 codex_home: dir.path().join("codex"),
                 browser: BrowserDecision::Skip(SkipReason::Flag),
+                approval: None,
                 _dir: dir,
             }
         }
 
         async fn connect(&mut self, args: &ConnectArgs) -> anyhow::Result<()> {
+            let approval = self
+                .approval
+                .as_ref()
+                .map(|(store, presence)| (store as &dyn ApprovalStore, presence as &dyn Presence));
             let mut env = ConnectEnv {
+                approval,
                 store: &self.store,
                 repo: &self.repo,
                 verifier: &self.verifier,
@@ -337,9 +398,10 @@ mod tests {
         assert_eq!(settings.toolsets, ["repository"]);
 
         let config = fs::read_to_string(codex::config_path(&fx.codex_home)).unwrap();
-        assert!(config.contains(
-            r#"args = ["serve", "--profile", "codex", "--allow-write", "--toolsets", "repository"]"#
-        ));
+        assert!(
+            config
+                .contains(r#"args = ["serve", "--profile", "codex", "--toolsets", "repository"]"#)
+        );
         let output = fx.ui.text();
         assert!(output.contains("mcp-codex"));
         assert!(output.contains("test-user"));
@@ -350,15 +412,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn access_flag_combinations() {
-        // (--allow-write, --allow-destructive) -> аргументы serve и сохранённые флаги.
-        let cases: [(bool, bool, &[&str]); 4] = [
-            (false, false, &[]),
-            (true, false, &["--allow-write"]),
-            (false, true, &["--allow-write", "--allow-destructive"]),
-            (true, true, &["--allow-write", "--allow-destructive"]),
-        ];
-        for (write, destructive, flags) in cases {
+    async fn access_flags_change_the_profile_not_the_registration() {
+        // (--allow-write, --allow-destructive) -> сохранённые флаги; регистрация без флагов.
+        let cases = [(false, false), (true, false), (false, true), (true, true)];
+        for (write, destructive) in cases {
             let mut fx = Fixture::new();
             fx.ui.tokens = ["good-token".to_owned()].into();
             let mut args = args(ClientKind::Codex);
@@ -371,19 +428,81 @@ mod tests {
             assert_eq!(settings.allow_write, write || destructive);
             assert_eq!(settings.allow_destructive, destructive);
 
-            let mut expected = vec!["serve", "--profile", "codex"];
-            expected.extend_from_slice(flags);
-            let expected = format!("args = {expected:?}");
+            let expected = r#"args = ["serve", "--profile", "codex"]"#;
             let config = fs::read_to_string(codex::config_path(&fx.codex_home)).unwrap();
-            assert!(config.contains(&expected), "{config}\nexpected: {expected}");
+            assert!(config.contains(expected), "{config}\nexpected: {expected}");
 
             let mut ui = ScriptedUi::default();
-            crate::cli::auth::status(&fx.store, &fx.repo, &mut ui, "codex").unwrap();
+            crate::cli::auth::status(&fx.store, &fx.repo, None, &mut ui, "codex").unwrap();
             let text = ui.text();
             let yes_no = |value: bool| if value { "yes" } else { "no" };
             assert!(text.contains(&format!("Write:    {}", yes_no(write || destructive))));
             assert!(text.contains(&format!("Delete:   {}", yes_no(destructive))));
         }
+
+        // Без флагов права профиля не меняются, каталоги профиля сохраняются.
+        let mut fx = Fixture::new();
+        fx.store.set("codex", &ApiToken::new("good-token")).unwrap();
+        let root = fx._dir.path().join("files");
+        fx.repo
+            .upsert(
+                "codex",
+                ProfileSettings {
+                    allow_write: true,
+                    allow_path: vec![root.clone()],
+                    ..ProfileSettings::default()
+                },
+            )
+            .unwrap();
+        let mut args = args(ClientKind::Codex);
+        args.yes = true;
+        fx.connect(&args).await.unwrap();
+        let settings = fx.repo.get("codex").unwrap().unwrap();
+        assert!(settings.allow_write && !settings.allow_destructive);
+        assert_eq!(settings.allow_path, vec![root.clone()]);
+        // С флагом меняется только уровень.
+        args.allow_destructive = true;
+        fx.connect(&args).await.unwrap();
+        let settings = fx.repo.get("codex").unwrap().unwrap();
+        assert!(settings.allow_destructive);
+        assert_eq!(settings.allow_path, vec![root]);
+    }
+
+    #[tokio::test]
+    async fn raising_access_needs_approval_on_macos() {
+        let mut fx = Fixture::new();
+        fx.store.set("codex", &ApiToken::new("good-token")).unwrap();
+        fx.approval = Some((MemoryApprovals::default(), FakePresence::new(false)));
+        let mut args = args(ClientKind::Codex);
+        args.allow_destructive = true;
+        args.yes = true;
+        fx.connect(&args).await.unwrap();
+        // Отказ: права прежние, но профиль и регистрация сохранены.
+        let settings = fx.repo.get("codex").unwrap().unwrap();
+        assert!(!settings.allow_write && !settings.allow_destructive);
+        let text = fx.ui.text();
+        assert!(text.contains("The access was not changed"), "{text}");
+        assert!(
+            text.contains("`sourcecraft-mcp ui` (profile `codex`)"),
+            "{text}"
+        );
+        assert!(codex::config_path(&fx.codex_home).exists());
+
+        fx.approval = Some((MemoryApprovals::default(), FakePresence::new(true)));
+        fx.ui = ScriptedUi::default();
+        fx.connect(&args).await.unwrap();
+        assert!(fx.repo.get("codex").unwrap().unwrap().allow_destructive);
+        let (approvals, presence) = fx.approval.as_ref().unwrap();
+        assert_eq!(presence.asked.get(), 1);
+        assert_eq!(
+            approvals.load("codex").unwrap().unwrap().level,
+            AccessLevel::Destructive
+        );
+        assert!(
+            fx.ui.text().contains("approved on this Mac"),
+            "{}",
+            fx.ui.text()
+        );
     }
 
     #[tokio::test]

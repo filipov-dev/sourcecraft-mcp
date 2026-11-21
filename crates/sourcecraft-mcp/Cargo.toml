@@ -13,12 +13,13 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "toki
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 dirs = "7.0.0"
+mcp-kit = { git = "https://git.sourcecraft.dev/filipov-dev/mcp-kit.git", tag = "v0.1.0" }
 rmcp = { version = "3.8.0", features = ["server", "transport-io", "transport-streamable-http-server"] }
 rpassword = "7.5.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-sourcecraft-api = { version = "0.2.0", path = "../sourcecraft-api" }
-sourcecraft-mcp-core = { version = "0.2.0", path = "../sourcecraft-mcp-core" }
+sourcecraft-api = { version = "0.3.0", path = "../sourcecraft-api" }
+sourcecraft-mcp-core = { version = "0.3.0", path = "../sourcecraft-mcp-core" }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "process", "io-util", "io-std", "fs"] }
 tokio-util = "0.7.20"
 toml = "1.2.0"

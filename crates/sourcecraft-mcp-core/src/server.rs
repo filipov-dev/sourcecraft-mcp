@@ -42,7 +42,7 @@ use crate::error::{ToolError, describe_api_error};
 use crate::files::FilePolicy;
 use crate::jq::{FILTER_INPUT_LIMIT, JqFilter, take_jq};
 use crate::redact::{redact_api_error, redact_response};
-use crate::registry::{ToolKind, ToolRegistry, access_name};
+use crate::registry::{ToolKind, ToolRegistry, access_hint, access_name};
 use crate::request::{build_request, check_guards};
 use crate::response::{TRUNCATED_NOTE, body_text, failure, response_text, success, truncate_text};
 use crate::secret_copy::{CopyPolicy, copy_secret};
@@ -318,7 +318,12 @@ impl SourceCraftServer {
         // Фильтр проверяется до запроса: ошибка в нём не должна появиться после записи.
         let jq = take_jq(&mut args)?;
         let reveal = take_reveal(op, &mut args, inner.options.allow_secret_values)?;
-        check_guards(op, &args, inner.options.max_access)?;
+        check_guards(
+            op,
+            &args,
+            inner.options.max_access,
+            inner.options.local_machine,
+        )?;
         let request = build_request(op, &args, &inner.files)?;
         let path = request.path.clone();
         let response = execute(client, request, jq.is_some()).await?;
@@ -422,9 +427,11 @@ impl SourceCraftServer {
         let (source, destination) = crate::secret_copy::parse_args(args)?;
         let policy = CopyPolicy {
             allow_overwrite: inner.options.max_access.allows(AccessLevel::Destructive),
-            overwrite_hint: "the server runs without --allow-destructive; ask the user to \
-                             restart it with that flag, or copy to a new key"
-                .to_owned(),
+            overwrite_hint: format!(
+                "the server runs without `destructive` access; ask the user to {}, or copy to a \
+                 new key",
+                access_hint(AccessLevel::Destructive, inner.options.local_machine)
+            ),
             // Удалённому серверу (HTTP) хранилище недоступно, даже если его передали.
             keychain: inner.options.keychain_source().cloned(),
             keychain_destination: false,
@@ -666,20 +673,33 @@ fn uses_legacy_session(context: &RequestContext<RoleServer>) -> bool {
 
 /// Инструкции сервера для агента (поле `instructions` в `initialize`).
 pub fn server_instructions(options: &ServerOptions, files: &FilePolicy) -> String {
-    let access = match options.max_access {
-        AccessLevel::Read => {
+    let access = match (options.max_access, options.local_machine) {
+        (AccessLevel::Read, true) => {
+            "This server is read-only: only tools that read data are available. Tools that \
+             create or change data are enabled when the user allows `write` access for the \
+             server's profile, and tools that delete data with `destructive` access (the user \
+             does it with `sourcecraft-mcp ui`, then restarts the client). If a task needs \
+             them, ask the user instead of looking for workarounds."
+        }
+        (AccessLevel::Read, false) => {
             "This server is read-only: only tools that read data are available. Tools that \
              create or change data are enabled when the user starts the server with \
              --allow-write, and tools that delete data with --allow-destructive. If a task needs \
              them, ask the user instead of looking for workarounds."
         }
-        AccessLevel::Write => {
+        (AccessLevel::Write, true) => {
+            "This server can read, create and change data, but not delete it: deleting tools \
+             (and making a repository public) need `destructive` access for the server's profile \
+             (`sourcecraft-mcp ui`). Confirm changes with the user when they were not explicitly \
+             requested."
+        }
+        (AccessLevel::Write, false) => {
             "This server can read, create and change data, but not delete it: deleting tools \
              (and making a repository public) need the user to start the server with \
              --allow-destructive. Confirm changes with the user when they were not explicitly \
              requested."
         }
-        AccessLevel::Destructive => {
+        (AccessLevel::Destructive, _) => {
             "This server can read, change and delete data. Deleting is irreversible: confirm \
              with the user before calling destructive tools unless they explicitly asked for it."
         }
@@ -745,7 +765,7 @@ fn local_instructions(options: &ServerOptions, files: &FilePolicy) -> String {
     format!(
         "- Local files: file arguments take a path (absolute, or relative to the server's \
          working directory) inside the allowed directories: {roots}. Other paths are rejected; \
-         the user can allow more with --allow-path.\n\
+         the user can allow more directories for the server's profile with `sourcecraft-mcp ui`.\n\
          - Secrets: never ask the user to paste tokens or secret values into the conversation. \
          The API token is managed by the server and is never available to tools; if the API \
          rejects it (HTTP 401), ask the user to store a new one with `{exe} auth login \
@@ -869,7 +889,11 @@ fn secrets_instructions(options: &ServerOptions) -> String {
              The value passes through the conversation, so set a secret only with a value the \
              user gave you for this purpose; otherwise ask the user to set it in SourceCraft."
         }
-        (false, _) => {
+        (false, true) => {
+            "Setting secrets (`secret_set`) needs `destructive` access for the server's profile \
+             (`sourcecraft-mcp ui`)."
+        }
+        (false, false) => {
             "Setting secrets (`secret_set`) needs the server to run with --allow-destructive."
         }
     };
@@ -903,8 +927,8 @@ mod tests {
         let files = FilePolicy::new(&[]).unwrap();
         let read = server_instructions(&ServerOptions::default(), &files);
         assert!(read.contains("read-only access"));
-        assert!(read.contains("--allow-write"));
-        assert!(read.contains("--allow-destructive"));
+        assert!(read.contains("`write` access"));
+        assert!(read.contains("`destructive` access"));
         assert!(read.contains("allowed directories: none"));
         assert!(read.contains("`api_search`") && read.contains("`api_request`"));
         assert!(read.contains("optional `jq` argument"));
@@ -951,7 +975,7 @@ mod tests {
         let read = server_instructions(&ServerOptions::default(), &files);
         assert!(read.contains("[redacted]"), "{read}");
         assert!(read.contains("does not reveal"), "{read}");
-        assert!(read.contains("`secret_set`) needs the server to run with --allow-destructive"));
+        assert!(read.contains("`secret_set`) needs `destructive` access for the server's profile"));
         assert!(!read.contains("reveal_values"));
 
         let all = server_instructions(
@@ -1009,6 +1033,15 @@ mod tests {
             ..ServerOptions::default()
         };
         let text = server_instructions(&remote, &FilePolicy::disabled());
+        let read_only = server_instructions(
+            &ServerOptions {
+                max_access: AccessLevel::Read,
+                ..remote.clone()
+            },
+            &FilePolicy::disabled(),
+        );
+        assert!(read_only.contains("--allow-write"), "{read_only}");
+        assert!(!read_only.contains("sourcecraft-mcp ui"), "{read_only}");
         for absent in [
             "secret exec",
             "secret write",
@@ -1029,6 +1062,9 @@ mod tests {
         let local = server_instructions(&ServerOptions::default(), &FilePolicy::new(&[]).unwrap());
         assert!(local.contains("auth login --profile <profile>"), "{local}");
         assert!(!local.contains("HTTP mode"), "{local}");
+        assert!(local.contains("sourcecraft-mcp ui"), "{local}");
+        assert!(!local.contains("--allow-write"), "{local}");
+        assert!(!local.contains("--allow-path"), "{local}");
     }
 
     #[test]
