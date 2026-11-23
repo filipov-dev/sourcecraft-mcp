@@ -1,7 +1,7 @@
 #!/bin/sh
 # Installer for sourcecraft-mcp (Linux and macOS).
 #
-#   curl -fsSL https://codeload.sourcecraft.tech/filipov-dev/sourcecraft-mcp/tarball/refs/heads/install | tar -xzO | sh
+#   curl -fsSL https://codeload.github.com/filipov-dev/sourcecraft-mcp/tar.gz/refs/heads/install | tar -xzO | sh
 #   ... | tar -xzO | sh -s -- --version v0.2.0 --prefix "$HOME/.local"
 #
 # Downloads the release archive for this OS and CPU, verifies it against the
@@ -15,8 +15,8 @@
 # to read it.
 set -eu
 
-REPO_URL="https://sourcecraft.dev/filipov-dev/sourcecraft-mcp"
-INSTALLER_URL="https://codeload.sourcecraft.tech/filipov-dev/sourcecraft-mcp/tarball/refs/heads/install"
+REPO_URL="https://github.com/filipov-dev/sourcecraft-mcp"
+INSTALLER_URL="https://codeload.github.com/filipov-dev/sourcecraft-mcp/tar.gz/refs/heads/install"
 BIN_NAME="sourcecraft-mcp"
 
 # Release list: "<tag> <asset name> <sha256 or -> <url>" per line, newest

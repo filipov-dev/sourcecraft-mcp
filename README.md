@@ -15,7 +15,7 @@ MCP-сервер и CLI для [SourceCraft](https://sourcecraft.dev) REST API. 
 ### Установочный скрипт (Linux и macOS)
 
 ```bash
-curl -fsSL https://codeload.sourcecraft.tech/filipov-dev/sourcecraft-mcp/tarball/refs/heads/install | tar -xzO | sh
+curl -fsSL https://codeload.github.com/filipov-dev/sourcecraft-mcp/tar.gz/refs/heads/install | tar -xzO | sh
 ```
 
 Скрипт ставит последнюю версию в `~/.local/bin` без `sudo` и сверяет архив с `SHA256SUMS` релиза; повторный запуск обновляет бинарник. Параметры (`--version`, `--prefix`) и подробности — в [docs/install.md](docs/install.md#установочный-скрипт).
@@ -31,7 +31,7 @@ Tap размещён на SourceCraft, поэтому `brew tap` нужен по
 
 ### Готовый архив
 
-Скачайте архив для своей платформы со [страницы релизов](https://sourcecraft.dev/filipov-dev/sourcecraft-mcp/releases), проверьте контрольную сумму по `SHA256SUMS` и положите бинарник `sourcecraft-mcp` (в Windows — `sourcecraft-mcp.exe`) в каталог из `PATH`.
+Скачайте архив для своей платформы со [страницы релизов на GitHub](https://github.com/filipov-dev/sourcecraft-mcp/releases) (код — в [SourceCraft](https://sourcecraft.dev/filipov-dev/sourcecraft-mcp) и в его копии на GitHub), проверьте контрольную сумму по `SHA256SUMS` и положите бинарник `sourcecraft-mcp` (в Windows — `sourcecraft-mcp.exe`) в каталог из `PATH`.
 
 | Платформа | Архив |
 | --- | --- |

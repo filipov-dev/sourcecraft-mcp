@@ -22,10 +22,10 @@ Linux-бинарник собран статически: ему не нужны
 Одна команда для Linux (x86_64, aarch64) и macOS, Homebrew не нужен:
 
 ```bash
-curl -fsSL https://codeload.sourcecraft.tech/filipov-dev/sourcecraft-mcp/tarball/refs/heads/install | tar -xzO | sh
+curl -fsSL https://codeload.github.com/filipov-dev/sourcecraft-mcp/tar.gz/refs/heads/install | tar -xzO | sh
 ```
 
-Адрес — архив ветки `install` публичного репозитория: в ней лежит только `install.sh` со списком релизов (адреса архивов и их SHA-256), его обновляет релизный конвейер. `tar -xzO` печатает этот скрипт, `sh` выполняет. Прямой постоянной ссылки на отдельный файл ветки SourceCraft не даёт, поэтому команда распаковывает архив ветки.
+Адрес — архив ветки `install` копии репозитория на GitHub: в ней лежит только `install.sh` со списком релизов (адреса архивов и их SHA-256), его обновляет релизный конвейер. `tar -xzO` печатает этот скрипт, `sh` выполняет. Архивы релизов тоже лежат на GitHub. Прежний адрес `https://codeload.sourcecraft.tech/filipov-dev/sourcecraft-mcp/tarball/refs/heads/install` работает и ставит те же архивы.
 
 Что делает скрипт:
 
@@ -40,10 +40,10 @@ curl -fsSL https://codeload.sourcecraft.tech/filipov-dev/sourcecraft-mcp/tarball
 
 ```bash
 # Конкретная версия
-curl -fsSL https://codeload.sourcecraft.tech/filipov-dev/sourcecraft-mcp/tarball/refs/heads/install | tar -xzO | sh -s -- --version v0.2.0
+curl -fsSL https://codeload.github.com/filipov-dev/sourcecraft-mcp/tar.gz/refs/heads/install | tar -xzO | sh -s -- --version v0.2.0
 
 # Другой каталог: бинарник попадёт в /opt/sourcecraft/bin
-curl -fsSL https://codeload.sourcecraft.tech/filipov-dev/sourcecraft-mcp/tarball/refs/heads/install | tar -xzO | sh -s -- --prefix /opt/sourcecraft
+curl -fsSL https://codeload.github.com/filipov-dev/sourcecraft-mcp/tar.gz/refs/heads/install | tar -xzO | sh -s -- --prefix /opt/sourcecraft
 ```
 
 | Параметр | Что делает |
@@ -54,7 +54,7 @@ curl -fsSL https://codeload.sourcecraft.tech/filipov-dev/sourcecraft-mcp/tarball
 | `--force` | Переустановить, даже если эта версия уже стоит. |
 | `--list` | Показать доступные версии и выйти. |
 
-Нужны `sh`, `tar`, `curl` или `wget`, `sha256sum` или `shasum`. Через скрипт доступны релизы со статическими Linux-бинарниками (начиная с v0.2.0). Чтобы прочитать скрипт перед запуском, сохраните его в файл: `curl -fsSL https://codeload.sourcecraft.tech/filipov-dev/sourcecraft-mcp/tarball/refs/heads/install | tar -xzO > install.sh`.
+Нужны `sh`, `tar`, `curl` или `wget`, `sha256sum` или `shasum`. Через скрипт доступны релизы со статическими Linux-бинарниками (начиная с v0.2.0). Чтобы прочитать скрипт перед запуском, сохраните его в файл: `curl -fsSL https://codeload.github.com/filipov-dev/sourcecraft-mcp/tar.gz/refs/heads/install | tar -xzO > install.sh`.
 
 ## Homebrew
 
@@ -80,7 +80,7 @@ brew untap filipov-dev/tap
 
 ## Готовый архив
 
-Архивы и файл `SHA256SUMS` публикуются на [странице релизов](https://sourcecraft.dev/filipov-dev/sourcecraft-mcp/releases). Имя архива: `sourcecraft-mcp-<тег>-<платформа>.tar.gz`, например `sourcecraft-mcp-v0.1.0-linux-x86_64.tar.gz`. Внутри — каталог с бинарником `sourcecraft-mcp`, `README.md` и лицензиями. Архив для Windows — `.zip`, его установка описана в разделе [Windows](#windows).
+Архивы и файл `SHA256SUMS` публикуются на [странице релизов](https://github.com/filipov-dev/sourcecraft-mcp/releases). Имя архива: `sourcecraft-mcp-<тег>-<платформа>.tar.gz`, например `sourcecraft-mcp-v0.1.0-linux-x86_64.tar.gz`. Внутри — каталог с бинарником `sourcecraft-mcp`, `README.md` и лицензиями. Архив для Windows — `.zip`, его установка описана в разделе [Windows](#windows).
 
 Проверьте контрольную сумму (из каталога, куда скачаны архив и `SHA256SUMS`):
 
@@ -104,7 +104,7 @@ sourcecraft-mcp --version
 
 ## Windows
 
-Для Windows есть только архив `sourcecraft-mcp-<тег>-windows-x86_64.zip` на [странице релизов](https://sourcecraft.dev/filipov-dev/sourcecraft-mcp/releases) (установочного скрипта и пакета для менеджеров пакетов нет). Внутри — каталог с `sourcecraft-mcp.exe`, `README.md` и лицензиями. Бинарнику не нужен Visual C++ Redistributable и другие библиотеки. Токены хранятся в Windows Credential Manager (общие учётные данные `<профиль>.dev.filipov.sourcecraft-mcp`).
+Для Windows есть только архив `sourcecraft-mcp-<тег>-windows-x86_64.zip` на [странице релизов](https://github.com/filipov-dev/sourcecraft-mcp/releases) (установочного скрипта и пакета для менеджеров пакетов нет). Внутри — каталог с `sourcecraft-mcp.exe`, `README.md` и лицензиями. Бинарнику не нужен Visual C++ Redistributable и другие библиотеки. Токены хранятся в Windows Credential Manager (общие учётные данные `<профиль>.dev.filipov.sourcecraft-mcp`).
 
 Скачайте архив и `SHA256SUMS` в один каталог и выполните в PowerShell из него (тег замените на нужный):
 

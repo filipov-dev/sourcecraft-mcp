@@ -18,8 +18,8 @@ rmcp = { version = "3.8.0", features = ["server", "transport-io", "transport-str
 rpassword = "7.5.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-sourcecraft-api = { version = "0.3.0", path = "../sourcecraft-api" }
-sourcecraft-mcp-core = { version = "0.3.0", path = "../sourcecraft-mcp-core" }
+sourcecraft-api = { version = "0.3.1", path = "../sourcecraft-api" }
+sourcecraft-mcp-core = { version = "0.3.1", path = "../sourcecraft-mcp-core" }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "process", "io-util", "io-std", "fs"] }
 tokio-util = "0.7.20"
 toml = "1.2.0"
