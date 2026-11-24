@@ -27,6 +27,10 @@ v0.3.1 sourcecraft-mcp-v0.3.1-macos-universal.tar.gz 0f0718cbf9332775acbe9d75bde
 v0.3.1 sourcecraft-mcp-v0.3.1-linux-x86_64.tar.gz 7f4b121141686c3ab82cf94d326eb52d46902a84405cb185c1c3b5b0cbbbb2f5 https://github.com/filipov-dev/sourcecraft-mcp/releases/download/v0.3.1/sourcecraft-mcp-v0.3.1-linux-x86_64.tar.gz
 v0.3.1 sourcecraft-mcp-v0.3.1-linux-aarch64.tar.gz 107af758f0f9244bf4c12b62b47b0da04c10cf382e99385fbf2f7f7f15e7d5d0 https://github.com/filipov-dev/sourcecraft-mcp/releases/download/v0.3.1/sourcecraft-mcp-v0.3.1-linux-aarch64.tar.gz
 v0.3.1 SHA256SUMS - https://github.com/filipov-dev/sourcecraft-mcp/releases/download/v0.3.1/SHA256SUMS
+v0.1.1 sourcecraft-mcp-v0.1.1-macos-universal.tar.gz 93ddfcc269d525d89be2c7471fe2f53a1f6893e41f9cf82e84026401f4a94b8c https://github.com/filipov-dev/sourcecraft-mcp/releases/download/v0.1.1/sourcecraft-mcp-v0.1.1-macos-universal.tar.gz
+v0.1.1 sourcecraft-mcp-v0.1.1-linux-x86_64.tar.gz 273c4157de233ddf52ae0f7b9e6503842912f31e158d6140c94390fb74d55292 https://github.com/filipov-dev/sourcecraft-mcp/releases/download/v0.1.1/sourcecraft-mcp-v0.1.1-linux-x86_64.tar.gz
+v0.1.1 sourcecraft-mcp-v0.1.1-linux-aarch64.tar.gz f0d90f75c2cf380200b901bcb9b82c491a568e91b6e505d1f8d4fca213620d45 https://github.com/filipov-dev/sourcecraft-mcp/releases/download/v0.1.1/sourcecraft-mcp-v0.1.1-linux-aarch64.tar.gz
+v0.1.1 SHA256SUMS - https://github.com/filipov-dev/sourcecraft-mcp/releases/download/v0.1.1/SHA256SUMS
 v0.1.0 sourcecraft-mcp-v0.1.0-macos-universal.tar.gz 76a3235cab1d517e7bc846dcd2484fc1c902b36dacdc27938aa9bf70f003fa91 https://github.com/filipov-dev/sourcecraft-mcp/releases/download/v0.1.0/sourcecraft-mcp-v0.1.0-macos-universal.tar.gz
 v0.1.0 sourcecraft-mcp-v0.1.0-linux-x86_64.tar.gz 504e72df1381741feb59177e74acf822832397a53d3d19eff8eaf1fb6401d52c https://github.com/filipov-dev/sourcecraft-mcp/releases/download/v0.1.0/sourcecraft-mcp-v0.1.0-linux-x86_64.tar.gz
 v0.1.0 sourcecraft-mcp-v0.1.0-linux-aarch64.tar.gz 0fc3ad540b1b8c2247787f7e270b81717895d50d129e5d8aa64e1536ba55931c https://github.com/filipov-dev/sourcecraft-mcp/releases/download/v0.1.0/sourcecraft-mcp-v0.1.0-linux-aarch64.tar.gz
